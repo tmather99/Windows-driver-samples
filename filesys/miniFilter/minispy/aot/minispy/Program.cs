@@ -1,13 +1,13 @@
 ﻿/*
  * C# port of mspyUser.c / mspyLog.c for MiniSpy.
- * Targets .NET 8.
- * All Win32/filter-manager interop is declared inline via P/Invoke.
+ * Targets .NET 8 with Native AOT.
+ * All Win32/filter-manager interop uses LibraryImport (source-generated P/Invoke).
  */
 
 using System;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Threading;
 
 namespace MiniSpy;
@@ -36,7 +36,7 @@ internal static class Constants
     public const uint RecordTypeFlagOutOfMemory = 0x10000000;
     public const uint RecordTypeFlagMask = 0xffff0000;
 
-    // IRP_MJ codes (subset used for display)
+    // IRP_MJ codes
     public const byte IrpMjCreate = 0x00;
     public const byte IrpMjCreateNamedPipe = 0x01;
     public const byte IrpMjClose = 0x02;
@@ -66,7 +66,7 @@ internal static class Constants
     public const byte IrpMjSetQuota = 0x1a;
     public const byte IrpMjPnp = 0x1b;
 
-    // FltMgr pseudo-major codes (cast from negative UCHAR)
+    // FltMgr pseudo-major codes
     public const byte IrpMjAcquireForSectionSync = 0xFF;
     public const byte IrpMjReleaseForSectionSync = 0xFE;
     public const byte IrpMjAcquireForModWrite = 0xFD;
@@ -133,7 +133,6 @@ internal static class Constants
     public const uint FltCallbackDataFastIoOperation = 0x00000002;
     public const uint FltCallbackDataFsFilterOp = 0x00000004;
 
-    // IO_REPARSE_TAG_MOUNT_POINT
     public const uint IoReparseTagMountPoint = 0xA0000003;
 
     // InterpretCommand return values
@@ -153,11 +152,11 @@ internal static class Constants
 }
 
 // -------------------------------------------------------------------------
-//  LOG_CONTEXT  (mirrors the C struct)
+//  LOG_CONTEXT
 // -------------------------------------------------------------------------
 internal sealed class LogContext
 {
-    public IntPtr Port = NativeMethods.InvalidHandleValue;
+    public nint Port = NativeMethods.InvalidHandleValue;
     public bool LogToScreen = false;
     public bool LogToFile = false;
     public StreamWriter? OutputFile = null;
@@ -167,7 +166,7 @@ internal sealed class LogContext
 }
 
 // -------------------------------------------------------------------------
-//  Unmanaged structs – laid out to match the kernel structures
+//  Unmanaged struct – must be blittable for AOT unsafe pointer cast
 // -------------------------------------------------------------------------
 [StructLayout(LayoutKind.Sequential)]
 internal struct RecordData
@@ -198,123 +197,124 @@ internal struct RecordData
 }
 
 // -------------------------------------------------------------------------
-//  P/Invoke declarations
+//  P/Invoke – LibraryImport (source-generated, AOT-safe)
 // -------------------------------------------------------------------------
-internal static class NativeMethods
+internal static partial class NativeMethods
 {
-    public static readonly IntPtr InvalidHandleValue = new IntPtr(-1);
+    public static readonly nint InvalidHandleValue = -1;
 
     // fltlib.dll
-    [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
-    public static extern int FilterConnectCommunicationPort(
-        [MarshalAs(UnmanagedType.LPWStr)] string portName,
+    [LibraryImport("fltlib.dll", StringMarshalling = StringMarshalling.Utf16)]
+    public static partial int FilterConnectCommunicationPort(
+        string portName,
         uint options,
-        IntPtr context,
+        nint context,
         ushort sizeOfContext,
-        IntPtr securityAttributes,
-        out IntPtr port);
+        nint securityAttributes,
+        out nint port);
 
-    [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
-    public static extern int FilterSendMessage(
-        IntPtr port,
-        IntPtr inBuffer,
+    [LibraryImport("fltlib.dll")]
+    public static partial int FilterSendMessage(
+        nint port,
+        nint inBuffer,
         uint inBufferSize,
-        IntPtr outBuffer,
+        nint outBuffer,
         uint outBufferSize,
         out uint bytesReturned);
 
-    [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
-    public static extern int FilterAttach(
-        [MarshalAs(UnmanagedType.LPWStr)] string filterName,
-        [MarshalAs(UnmanagedType.LPWStr)] string volumeName,
-        [MarshalAs(UnmanagedType.LPWStr)] string? instanceName,
+    [LibraryImport("fltlib.dll", StringMarshalling = StringMarshalling.Utf16)]
+    public static partial int FilterAttach(
+        string filterName,
+        string volumeName,
+        string? instanceName,
         uint createdInstanceNameLength,
-        [MarshalAs(UnmanagedType.LPWStr)] StringBuilder createdInstanceName);
+        char[]? createdInstanceName);
 
-    [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
-    public static extern int FilterDetach(
-        [MarshalAs(UnmanagedType.LPWStr)] string filterName,
-        [MarshalAs(UnmanagedType.LPWStr)] string volumeName,
-        [MarshalAs(UnmanagedType.LPWStr)] string? instanceName);
+    [LibraryImport("fltlib.dll", StringMarshalling = StringMarshalling.Utf16)]
+    public static partial int FilterDetach(
+        string filterName,
+        string volumeName,
+        string? instanceName);
 
-    [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
-    public static extern int FilterVolumeFindFirst(
+    [LibraryImport("fltlib.dll")]
+    public static partial int FilterVolumeFindFirst(
         uint informationClass,
-        IntPtr buffer,
+        nint buffer,
         uint bufferSize,
         out uint bytesReturned,
-        out IntPtr volumeIterator);
+        out nint volumeIterator);
 
-    [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
-    public static extern int FilterVolumeFindNext(
-        IntPtr volumeIterator,
+    [LibraryImport("fltlib.dll")]
+    public static partial int FilterVolumeFindNext(
+        nint volumeIterator,
         uint informationClass,
-        IntPtr buffer,
+        nint buffer,
         uint bufferSize,
         out uint bytesReturned);
 
-    [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
-    public static extern int FilterVolumeFindClose(IntPtr volumeIterator);
+    [LibraryImport("fltlib.dll")]
+    public static partial int FilterVolumeFindClose(nint volumeIterator);
 
-    [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
-    public static extern int FilterVolumeInstanceFindFirst(
-        [MarshalAs(UnmanagedType.LPWStr)] string volumeName,
+    [LibraryImport("fltlib.dll", StringMarshalling = StringMarshalling.Utf16)]
+    public static partial int FilterVolumeInstanceFindFirst(
+        string volumeName,
         uint informationClass,
-        IntPtr buffer,
+        nint buffer,
         uint bufferSize,
         out uint bytesReturned,
-        out IntPtr instanceIterator);
+        out nint instanceIterator);
 
-    [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
-    public static extern int FilterVolumeInstanceFindNext(
-        IntPtr instanceIterator,
+    [LibraryImport("fltlib.dll")]
+    public static partial int FilterVolumeInstanceFindNext(
+        nint instanceIterator,
         uint informationClass,
-        IntPtr buffer,
+        nint buffer,
         uint bufferSize,
         out uint bytesReturned);
 
-    [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
-    public static extern int FilterVolumeInstanceFindClose(IntPtr instanceIterator);
+    [LibraryImport("fltlib.dll")]
+    public static partial int FilterVolumeInstanceFindClose(nint instanceIterator);
 
-    [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
-    public static extern int FilterGetDosName(
-        [MarshalAs(UnmanagedType.LPWStr)] string volumeName,
-        [MarshalAs(UnmanagedType.LPWStr)] StringBuilder dosName,
+    [LibraryImport("fltlib.dll", StringMarshalling = StringMarshalling.Utf16)]
+    public static partial int FilterGetDosName(
+        string volumeName,
+        char[] dosName,
         uint dosNameBufferSize);
 
     // kernel32.dll
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool CloseHandle(IntPtr handle);
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool CloseHandle(nint handle);
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern uint FormatMessage(
+    [LibraryImport("kernel32.dll", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    public static partial uint FormatMessage(
         uint dwFlags,
-        IntPtr lpSource,
+        nint lpSource,
         uint dwMessageId,
         uint dwLanguageId,
-        StringBuilder lpBuffer,
+        char[] lpBuffer,
         uint nSize,
-        IntPtr arguments);
+        nint arguments);
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern uint GetSystemDirectory(
-        StringBuilder lpBuffer,
+    [LibraryImport("kernel32.dll", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    public static partial uint GetSystemDirectory(
+        char[] lpBuffer,
         uint uSize);
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern IntPtr LoadLibraryEx(
+    [LibraryImport("kernel32.dll", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    public static partial nint LoadLibraryEx(
         string lpFileName,
-        IntPtr hFile,
+        nint hFile,
         uint dwFlags);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool FreeLibrary(IntPtr hModule);
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool FreeLibrary(nint hModule);
 
     public const uint FORMAT_MESSAGE_FROM_SYSTEM = 0x00001000;
     public const uint FORMAT_MESSAGE_FROM_HMODULE = 0x00000800;
     public const uint LOAD_LIBRARY_AS_DATAFILE = 0x00000002;
 
-    // HRESULT helpers
     public static bool IsError(int hr) => hr < 0;
     public static bool Succeeded(int hr) => hr >= 0;
     public static int HResultFromWin32(int e) => e <= 0 ? e : (int)(((uint)e & 0x0000FFFF) | 0x80070000);
@@ -324,7 +324,7 @@ internal static class NativeMethods
 }
 
 // -------------------------------------------------------------------------
-//  Logging / display helpers  (port of mspyLog.c)
+//  Logging helpers
 // -------------------------------------------------------------------------
 internal static class MspyLog
 {
@@ -419,8 +419,6 @@ internal static class MspyLog
             case Constants.IrpMjQueryQuota: return "IRP_MJ_QUERY_QUOTA";
             case Constants.IrpMjSetQuota: return "IRP_MJ_SET_QUOTA";
             case Constants.IrpMjPnp: return "IRP_MJ_PNP";
-
-            // FltMgr pseudo-major codes
             case Constants.IrpMjAcquireForSectionSync: return "IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION";
             case Constants.IrpMjReleaseForSectionSync: return "IRP_MJ_RELEASE_FOR_SECTION_SYNCHRONIZATION";
             case Constants.IrpMjAcquireForModWrite: return "IRP_MJ_ACQUIRE_FOR_MOD_WRITE";
@@ -437,9 +435,7 @@ internal static class MspyLog
             case Constants.IrpMjVolumeMount: return "IRP_MJ_VOLUME_MOUNT";
             case Constants.IrpMjVolumeDismount: return "IRP_MJ_VOLUME_DISMOUNT";
             case Constants.IrpMjTransactionNotify: return "IRP_MJ_TRANSACTION_NOTIFY";
-
-            default:
-                return $"UNKNOWN_MJ (0x{major:X2})";
+            default: return $"UNKNOWN_MJ (0x{major:X2})";
         }
     }
 
@@ -460,8 +456,7 @@ internal static class MspyLog
     {
         try
         {
-            DateTime dt = DateTime.FromFileTimeUtc(fileTime).ToLocalTime();
-            return dt.ToString("HH:mm:ss.fff");
+            return DateTime.FromFileTimeUtc(fileTime).ToLocalTime().ToString("HH:mm:ss.fff");
         }
         catch
         {
@@ -472,7 +467,6 @@ internal static class MspyLog
     public static void ScreenDump(uint sequenceNumber, string name, ref RecordData data)
     {
         string irpMajor = GetIrpString(data.CallbackMajorId, data.CallbackMinorId, out string? irpMinor);
-
         string originTime = FormatTime(data.OriginatingTime);
         string complTime = data.CompletionTime == 0 ? "" : FormatTime(data.CompletionTime);
 
@@ -480,7 +474,6 @@ internal static class MspyLog
 
         if (!string.IsNullOrEmpty(irpMinor))
             Console.Write($" ({irpMinor})");
-
         if (!string.IsNullOrEmpty(complTime))
             Console.Write($" Completed={complTime}");
 
@@ -490,12 +483,10 @@ internal static class MspyLog
     public static void FileDump(uint sequenceNumber, string name, ref RecordData data, StreamWriter file)
     {
         string irpMajor = GetIrpString(data.CallbackMajorId, data.CallbackMinorId, out string? irpMinor);
-
         string originTime = FormatTime(data.OriginatingTime);
         string complTime = data.CompletionTime == 0 ? "" : FormatTime(data.CompletionTime);
 
         string line = $"{sequenceNumber:X8}\t{name}\t{originTime}\t{irpMajor}\t{irpMinor ?? ""}\t{(uint)data.Status:X8}\t{data.Information:X16}";
-
         if (!string.IsNullOrEmpty(complTime))
             line += $"\t{complTime}";
 
@@ -503,33 +494,36 @@ internal static class MspyLog
     }
 
     // -----------------------------------------------------------------------
-    //  RetrieveLogRecords  – runs on a background thread
+    //  RetrieveLogRecords – AOT-safe: unsafe pointer cast replaces
+    //  Marshal.PtrToStructure, sizeof(T) replaces Marshal.SizeOf<T>
     // -----------------------------------------------------------------------
-    public static void RetrieveLogRecords(object? parameter)
+    public static unsafe void RetrieveLogRecords(object? parameter)
     {
         LogContext context = (LogContext)parameter!;
 
-        // Command message buffer: MINISPY_COMMAND (uint) + Reserved (uint) = 8 bytes
         const int cmdSize = 8;
-        IntPtr cmdBuffer = Marshal.AllocHGlobal(cmdSize);
-        IntPtr outBuffer = Marshal.AllocHGlobal(Constants.BufferSize);
+        // Layout: MINISPY_COMMAND(4) + Reserved(4)
+        uint* cmdBuffer = (uint*)NativeMemory.Alloc(cmdSize);
+        byte* outBuffer = (byte*)NativeMemory.Alloc(Constants.BufferSize);
 
-        int recordDataOffset = 16; // offset of RECORD_DATA within LOG_RECORD
-        int recordDataSize = Marshal.SizeOf<RecordData>();
-        int nameBaseOffset = recordDataOffset + recordDataSize;
+        // Offsets within LOG_RECORD:
+        //   0: Length(4), 4: SequenceNumber(4), 8: RecordType(4), 12: Reserved(4)
+        //  16: RecordData, 16+sizeof(RecordData): Name (WCHAR[])
+        const int recordDataOffset = 16;
+        int nameBaseOffset = recordDataOffset + sizeof(RecordData);
 
         try
         {
             while (!context.CleaningUp)
             {
-                Marshal.WriteInt32(cmdBuffer, 0, (int)Constants.GetMiniSpyLog);
-                Marshal.WriteInt32(cmdBuffer, 4, 0); // Reserved
+                cmdBuffer[0] = Constants.GetMiniSpyLog;
+                cmdBuffer[1] = 0; // Reserved
 
                 int hr = NativeMethods.FilterSendMessage(
                     context.Port,
-                    cmdBuffer,
+                    (nint)cmdBuffer,
                     cmdSize,
-                    outBuffer,
+                    (nint)outBuffer,
                     Constants.BufferSize,
                     out uint bytesReturned);
 
@@ -544,23 +538,23 @@ internal static class MspyLog
                     {
                         if (hr != NativeMethods.ERROR_NO_MORE_ITEMS)
                             Console.WriteLine($"UNEXPECTED ERROR received: {hr:X}");
-
                         Thread.Sleep(Constants.PollIntervalMs);
                     }
                     continue;
                 }
 
                 uint used = 0;
-                IntPtr cursor = outBuffer;
+                byte* cursor = outBuffer;
 
                 while (true)
                 {
                     if (used + (uint)recordDataOffset > bytesReturned)
                         break;
 
-                    uint length = (uint)Marshal.ReadInt32(cursor, 0);
-                    uint seqNum = (uint)Marshal.ReadInt32(cursor, 4);
-                    uint recordType = (uint)Marshal.ReadInt32(cursor, 8);
+                    uint* header = (uint*)cursor;
+                    uint length     = header[0];
+                    uint seqNum     = header[1];
+                    uint recordType = header[2];
 
                     if (length < (uint)(nameBaseOffset + 2))
                     {
@@ -576,22 +570,23 @@ internal static class MspyLog
                         break;
                     }
 
-                    RecordData data = Marshal.PtrToStructure<RecordData>(
-                        IntPtr.Add(cursor, recordDataOffset));
+                    // AOT-safe: direct pointer cast instead of Marshal.PtrToStructure
+                    RecordData data = Unsafe.ReadUnaligned<RecordData>(cursor + recordDataOffset);
 
-                    string? name = Marshal.PtrToStringUni(IntPtr.Add(cursor, nameBaseOffset));
+                    // Read null-terminated UTF-16 name
+                    string name = new string((char*)(cursor + nameBaseOffset));
 
                     if ((recordType & Constants.RecordTypeFiletag) != 0)
                     {
-                        cursor = IntPtr.Add(cursor, (int)length);
+                        cursor += length;
                         continue;
                     }
 
                     if (context.LogToScreen)
-                        ScreenDump(seqNum, name ?? string.Empty, ref data);
+                        ScreenDump(seqNum, name, ref data);
 
                     if (context.LogToFile && context.OutputFile != null)
-                        FileDump(seqNum, name ?? string.Empty, ref data, context.OutputFile);
+                        FileDump(seqNum, name, ref data, context.OutputFile);
 
                     if ((recordType & Constants.RecordTypeFlagOutOfMemory) != 0)
                     {
@@ -608,7 +603,7 @@ internal static class MspyLog
                             context.OutputFile.WriteLine($"M:\t0x{seqNum:X8}\tExceeded Maximum Allowed Memory Buffers");
                     }
 
-                    cursor = IntPtr.Add(cursor, (int)length);
+                    cursor += length;
                 }
 
                 if (bytesReturned == 0)
@@ -617,8 +612,8 @@ internal static class MspyLog
         }
         finally
         {
-            Marshal.FreeHGlobal(cmdBuffer);
-            Marshal.FreeHGlobal(outBuffer);
+            NativeMemory.Free(cmdBuffer);
+            NativeMemory.Free(outBuffer);
         }
 
         Console.WriteLine("Log: Shutting down");
@@ -628,107 +623,99 @@ internal static class MspyLog
 }
 
 // -------------------------------------------------------------------------
-//  Program  – port of mspyUser.c main() + helpers
+//  Program
 // -------------------------------------------------------------------------
 internal sealed class Program
 {
-    // -----------------------------------------------------------------------
-    //  DisplayError
-    // -----------------------------------------------------------------------
-    private static void DisplayError(int code)
+    private static unsafe void DisplayError(int code)
     {
-        var buffer = new StringBuilder(260);
-        uint count = NativeMethods.FormatMessage(
-            NativeMethods.FORMAT_MESSAGE_FROM_SYSTEM,
-            IntPtr.Zero,
-            (uint)code,
-            0,
-            buffer,
-            (uint)buffer.Capacity,
-            IntPtr.Zero);
+        char[] buffer = new char[260];
 
-        if (count == 0)
+        fixed (char* pBuf = buffer)
         {
-            var dir = new StringBuilder(260);
-            uint dirLen = NativeMethods.GetSystemDirectory(dir, (uint)dir.Capacity);
-            if (dirLen == 0 || dirLen > (uint)dir.Capacity)
-            {
-                Console.WriteLine($"    Could not translate error: {code}");
-                return;
-            }
-
-            dir.Append(@"\fltlib.dll");
-
-            IntPtr module = NativeMethods.LoadLibraryEx(dir.ToString(), IntPtr.Zero,
-                NativeMethods.LOAD_LIBRARY_AS_DATAFILE);
-
-            count = NativeMethods.FormatMessage(
-                NativeMethods.FORMAT_MESSAGE_FROM_HMODULE,
-                module,
+            uint count = NativeMethods.FormatMessage(
+                NativeMethods.FORMAT_MESSAGE_FROM_SYSTEM,
+                0,
                 (uint)code,
                 0,
                 buffer,
-                (uint)buffer.Capacity,
-                IntPtr.Zero);
-
-            if (module != IntPtr.Zero)
-                NativeMethods.FreeLibrary(module);
+                (uint)buffer.Length,
+                0);
 
             if (count == 0)
             {
-                Console.WriteLine($"    Could not translate error: {code}");
-                return;
-            }
-        }
+                char[] dirBuf = new char[260];
+                uint dirLen = NativeMethods.GetSystemDirectory(dirBuf, (uint)dirBuf.Length);
+                if (dirLen == 0 || dirLen > (uint)dirBuf.Length)
+                {
+                    Console.WriteLine($"    Could not translate error: {code}");
+                    return;
+                }
 
-        Console.WriteLine($"    {buffer}");
+                string path = new string(dirBuf, 0, (int)dirLen) + @"\fltlib.dll";
+                nint module = NativeMethods.LoadLibraryEx(path, 0, NativeMethods.LOAD_LIBRARY_AS_DATAFILE);
+
+                count = NativeMethods.FormatMessage(
+                    NativeMethods.FORMAT_MESSAGE_FROM_HMODULE,
+                    module,
+                    (uint)code,
+                    0,
+                    buffer,
+                    (uint)buffer.Length,
+                    0);
+
+                if (module != 0)
+                    NativeMethods.FreeLibrary(module);
+
+                if (count == 0)
+                {
+                    Console.WriteLine($"    Could not translate error: {code}");
+                    return;
+                }
+            }
+
+            Console.WriteLine($"    {new string(buffer).TrimEnd('\0', '\r', '\n')}");
+        }
     }
 
-    // -----------------------------------------------------------------------
-    //  IsAttachedToVolume
-    // -----------------------------------------------------------------------
-    private static uint IsAttachedToVolume(string volumeName)
+    private static unsafe uint IsAttachedToVolume(string volumeName)
     {
         const int bufSize = 1024;
         const int apiBufferSize = bufSize - 2;
-        IntPtr buf = Marshal.AllocHGlobal(bufSize);
-        IntPtr instanceIterator = NativeMethods.InvalidHandleValue;
+        byte* buf = (byte*)NativeMemory.Alloc(bufSize);
+        nint instanceIterator = NativeMethods.InvalidHandleValue;
         uint instanceCount = 0;
 
         try
         {
             int hr = NativeMethods.FilterVolumeInstanceFindFirst(
-                volumeName,
-                1,
-                buf,
-                apiBufferSize,
-                out _,
-                out instanceIterator);
+                volumeName, 1, (nint)buf, apiBufferSize, out _, out instanceIterator);
 
             if (NativeMethods.IsError(hr))
                 return 0;
 
             do
             {
-                ushort filterNameLength = (ushort)Marshal.ReadInt16(buf, 12);
-                ushort filterNameBufferOffset = (ushort)Marshal.ReadInt16(buf, 14);
+                // INSTANCE_FULL_INFORMATION offsets:
+                // 12: FilterNameLength (USHORT), 14: FilterNameBufferOffset (USHORT)
+                ushort filterNameLength       = *(ushort*)(buf + 12);
+                ushort filterNameBufferOffset = *(ushort*)(buf + 14);
 
                 if ((filterNameBufferOffset + filterNameLength + 2) > bufSize)
                 {
                     hr = NativeMethods.FilterVolumeInstanceFindNext(
-                        instanceIterator, 1, buf, apiBufferSize, out _);
+                        instanceIterator, 1, (nint)buf, apiBufferSize, out _);
                     continue;
                 }
 
-                string filterName = Marshal.PtrToStringUni(
-                    IntPtr.Add(buf, filterNameBufferOffset),
-                    filterNameLength / sizeof(char))!;
+                string filterName = new string((char*)(buf + filterNameBufferOffset),
+                    0, filterNameLength / sizeof(char));
 
                 if (string.Equals(filterName, Constants.MiniSpyName, StringComparison.OrdinalIgnoreCase))
                     instanceCount++;
 
                 hr = NativeMethods.FilterVolumeInstanceFindNext(
-                    instanceIterator, 1, buf, apiBufferSize, out _);
+                    instanceIterator, 1, (nint)buf, apiBufferSize, out _);
 
             } while (NativeMethods.Succeeded(hr));
         }
@@ -736,30 +723,23 @@ internal sealed class Program
         {
             if (instanceIterator != NativeMethods.InvalidHandleValue)
                 NativeMethods.FilterVolumeInstanceFindClose(instanceIterator);
-            Marshal.FreeHGlobal(buf);
+            NativeMemory.Free(buf);
         }
 
         return instanceCount;
     }
 
-    // -----------------------------------------------------------------------
-    //  ListDevices
-    // -----------------------------------------------------------------------
-    private static void ListDevices()
+    private static unsafe void ListDevices()
     {
         const int bufSize = 1024;
         const int apiBufferSize = bufSize - 2;
-        IntPtr buf = Marshal.AllocHGlobal(bufSize);
-        IntPtr volumeIterator = NativeMethods.InvalidHandleValue;
+        byte* buf = (byte*)NativeMemory.Alloc(bufSize);
+        nint volumeIterator = NativeMethods.InvalidHandleValue;
 
         try
         {
             int hr = NativeMethods.FilterVolumeFindFirst(
-                0,
-                buf,
-                apiBufferSize,
-                out _,
-                out volumeIterator);
+                0, (nint)buf, apiBufferSize, out _, out volumeIterator);
 
             if (NativeMethods.IsError(hr))
                 return;
@@ -770,28 +750,28 @@ internal sealed class Program
 
             do
             {
-                ushort nameLength = (ushort)Marshal.ReadInt16(buf, 0);
+                // FILTER_VOLUME_BASIC_INFORMATION: 0=FilterVolumeNameLength(USHORT), 2=FilterVolumeName(WCHAR[])
+                ushort nameLength = *(ushort*)buf;
 
                 if ((2u + nameLength + 2u) > (uint)bufSize)
                 {
                     Console.WriteLine($"Volume name length {nameLength} exceeds buffer; skipping.");
                     hr = NativeMethods.FilterVolumeFindNext(
-                        volumeIterator, 0, buf, apiBufferSize, out _);
+                        volumeIterator, 0, (nint)buf, apiBufferSize, out _);
                     continue;
                 }
 
-                Marshal.WriteInt16(buf, 2 + nameLength, 0);
+                // Null-terminate in place
+                *(char*)(buf + 2 + nameLength) = '\0';
 
-                string volName = Marshal.PtrToStringUni(
-                    IntPtr.Add(buf, 2),
-                    nameLength / sizeof(char))!;
+                string volName = new string((char*)(buf + 2), 0, nameLength / sizeof(char));
 
                 uint instanceCount = IsAttachedToVolume(volName);
 
-                var dosName = new StringBuilder(15);
+                char[] dosNameBuf = new char[15];
                 string dosStr = NativeMethods.Succeeded(
-                    NativeMethods.FilterGetDosName(volName, dosName, (uint)dosName.Capacity))
-                    ? dosName.ToString()
+                    NativeMethods.FilterGetDosName(volName, dosNameBuf, (uint)dosNameBuf.Length))
+                    ? new string(dosNameBuf).TrimEnd('\0')
                     : "";
 
                 Console.Write($"{dosStr,-14}  {volName,-36}  {(instanceCount > 0 ? "Attached" : "")}");
@@ -802,7 +782,7 @@ internal sealed class Program
                     Console.WriteLine();
 
                 hr = NativeMethods.FilterVolumeFindNext(
-                    volumeIterator, 0, buf, apiBufferSize, out _);
+                    volumeIterator, 0, (nint)buf, apiBufferSize, out _);
 
             } while (NativeMethods.Succeeded(hr));
         }
@@ -810,13 +790,10 @@ internal sealed class Program
         {
             if (volumeIterator != NativeMethods.InvalidHandleValue)
                 NativeMethods.FilterVolumeFindClose(volumeIterator);
-            Marshal.FreeHGlobal(buf);
+            NativeMemory.Free(buf);
         }
     }
 
-    // -----------------------------------------------------------------------
-    //  InterpretCommand
-    // -----------------------------------------------------------------------
     private static int InterpretCommand(string[] argv, LogContext context)
     {
         int returnValue = Constants.Success;
@@ -843,18 +820,16 @@ internal sealed class Program
                             string volume = argv[parmIndex];
                             Console.Write($"    Attaching to {volume}... ");
 
-                            var instanceName = new StringBuilder(Constants.InstanceNameMaxChars + 1);
+                            char[] instanceName = new char[Constants.InstanceNameMaxChars + 1];
                             int hr = NativeMethods.FilterAttach(
                                 Constants.MiniSpyName,
                                 volume,
                                 null,
-                                (uint)((Constants.InstanceNameMaxChars + 1) * 2),
+                                (uint)(instanceName.Length * sizeof(char)),
                                 instanceName);
 
                             if (NativeMethods.Succeeded(hr))
-                            {
-                                Console.WriteLine($"    Instance name: {instanceName}");
-                            }
+                                Console.WriteLine($"    Instance name: {new string(instanceName).TrimEnd('\0')}");
                             else
                             {
                                 Console.WriteLine($"\n    Could not attach to device: 0x{(uint)hr:X8}");
@@ -884,9 +859,7 @@ internal sealed class Program
                             }
 
                             int hr = NativeMethods.FilterDetach(
-                                Constants.MiniSpyName,
-                                volume,
-                                instanceString);
+                                Constants.MiniSpyName, volume, instanceString);
 
                             if (NativeMethods.IsError(hr))
                             {
@@ -938,9 +911,7 @@ internal sealed class Program
             {
                 if (string.Equals(parm, Constants.InterpreterExitCommand1, StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(parm, Constants.InterpreterExitCommand2, StringComparison.OrdinalIgnoreCase))
-                {
                     return Constants.ExitInterpreter;
-                }
 
                 if (string.Equals(parm, Constants.ProgramExitCommand, StringComparison.OrdinalIgnoreCase))
                     return Constants.ExitProgram;
@@ -968,12 +939,9 @@ internal sealed class Program
         return Constants.UsageError;
     }
 
-    // -----------------------------------------------------------------------
-    //  Main
-    // -----------------------------------------------------------------------
     static int Main(string[] args)
     {
-        IntPtr port = NativeMethods.InvalidHandleValue;
+        nint port = NativeMethods.InvalidHandleValue;
         LogContext context = new LogContext();
 
         try
@@ -981,12 +949,7 @@ internal sealed class Program
             Console.WriteLine("Connecting to filter's port...");
 
             int hResult = NativeMethods.FilterConnectCommunicationPort(
-                Constants.MiniSpyPortName,
-                0,
-                IntPtr.Zero,
-                0,
-                IntPtr.Zero,
-                out port);
+                Constants.MiniSpyPortName, 0, 0, 0, 0, out port);
 
             if (NativeMethods.IsError(hResult))
             {
@@ -1010,10 +973,7 @@ internal sealed class Program
             }
 
             Console.WriteLine("Creating logging thread...");
-            Thread loggingThread = new Thread(MspyLog.RetrieveLogRecords)
-            {
-                IsBackground = false
-            };
+            Thread loggingThread = new Thread(MspyLog.RetrieveLogRecords) { IsBackground = false };
             loggingThread.Start(context);
 
             ListDevices();
@@ -1027,11 +987,8 @@ internal sealed class Program
             while (!exitProgram)
             {
                 int ch = Console.Read();
-                if (ch < 0)
-                    break;
-
-                if ((char)ch != '\n')
-                    continue;
+                if (ch < 0) break;
+                if ((char)ch != '\n') continue;
 
                 context.NextLogToScreen = context.LogToScreen;
                 context.LogToScreen = false;
@@ -1042,28 +999,17 @@ internal sealed class Program
                     Console.Write(">");
 
                     string? line = Console.ReadLine();
-                    if (line == null)
-                    {
-                        exitProgram = true;
-                        break;
-                    }
+                    if (line == null) { exitProgram = true; break; }
 
                     string trimmed = line.Trim();
-                    if (trimmed.Length == 0)
-                        continue;
+                    if (trimmed.Length == 0) continue;
 
                     string[] parts = trimmed.Split(
-                        ' ',
-                        Constants.NumParams,
-                        StringSplitOptions.RemoveEmptyEntries);
+                        ' ', Constants.NumParams, StringSplitOptions.RemoveEmptyEntries);
 
                     returnValue = InterpretCommand(parts, context);
 
-                    if (returnValue == Constants.ExitProgram)
-                    {
-                        exitProgram = true;
-                        break;
-                    }
+                    if (returnValue == Constants.ExitProgram) { exitProgram = true; break; }
                 }
 
                 context.LogToScreen = context.NextLogToScreen;
@@ -1085,7 +1031,6 @@ internal sealed class Program
         finally
         {
             context.ShutDown?.Dispose();
-
             if (port != NativeMethods.InvalidHandleValue)
                 NativeMethods.CloseHandle(port);
         }
