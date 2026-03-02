@@ -149,6 +149,14 @@ internal static class Constants
     public const int NumParams = 40;
 
     public const int InstanceNameMaxChars = 255;
+
+    // IRP_MJ_CREATE IoStatus.Information values
+    public const ulong FileSuperseded  = 0; // New file created by superseding existing
+    public const ulong FileOpened      = 1; // Existing file opened
+    public const ulong FileCreated     = 2; // New file created
+    public const ulong FileOverwritten = 3; // Existing file overwritten
+    public const ulong FileExists      = 4; // File exists but was not opened (e.g. FILE_CREATE disposition)
+    public const ulong FileDoesNotExist = 5; // File does not exist
 }
 
 // -------------------------------------------------------------------------
@@ -163,6 +171,26 @@ internal sealed class LogContext
     public bool NextLogToScreen = true;
     public volatile bool CleaningUp = false;
     public Semaphore? ShutDown = null;
+
+    /// <summary>
+    /// When non-null, only records whose file name starts with this prefix
+    /// (case-insensitive, path-separator normalised) are reported.
+    /// </summary>
+    public volatile string? FolderFilter = null;
+
+    /// <summary>
+    /// When false (default), suppresses noisy fast-path operations such as
+    /// IRP_MJ_NETWORK_QUERY_OPEN with NETWORK_QUERY_OPEN_DECLINED and
+    /// IRP_MJ_ACQUIRE/RELEASE_FOR_SECTION_SYNCHRONIZATION.
+    /// </summary>
+    public volatile bool Verbose = false;
+
+    /// <summary>
+    /// When true, only IRP_MJ_CREATE operations where an existing file was
+    /// opened (Information == FILE_OPENED == 1) are reported.  Creates of
+    /// new files, supersedes, overwrites etc. are suppressed.
+    /// </summary>
+    public volatile bool OpenOnly = false;
 }
 
 // -------------------------------------------------------------------------
@@ -286,7 +314,8 @@ internal static partial class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool CloseHandle(nint handle);
 
-    [LibraryImport("kernel32.dll", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    [LibraryImport("kernel32.dll", EntryPoint = "FormatMessageW",
+        StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
     public static partial uint FormatMessage(
         uint dwFlags,
         nint lpSource,
@@ -296,12 +325,14 @@ internal static partial class NativeMethods
         uint nSize,
         nint arguments);
 
-    [LibraryImport("kernel32.dll", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    [LibraryImport("kernel32.dll", EntryPoint = "GetSystemDirectoryW",
+        StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
     public static partial uint GetSystemDirectory(
         char[] lpBuffer,
         uint uSize);
 
-    [LibraryImport("kernel32.dll", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    [LibraryImport("kernel32.dll", EntryPoint = "LoadLibraryExW",
+        StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
     public static partial nint LoadLibraryEx(
         string lpFileName,
         nint hFile,
@@ -321,6 +352,34 @@ internal static partial class NativeMethods
 
     public static readonly int ERROR_NO_MORE_ITEMS = HResultFromWin32(259);
     public static readonly int ERROR_INVALID_HANDLE_HR = HResultFromWin32(6);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "QueryDosDeviceW",
+        StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    public static partial uint QueryDosDevice(
+        string? lpDeviceName,
+        char[] lpTargetPath,
+        uint ucchMax);
+
+    [LibraryImport("ntdll.dll", EntryPoint = "RtlNtStatusToDosError")]
+    public static partial uint RtlNtStatusToDosError(int status);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    public static partial nint OpenProcess(
+        uint dwDesiredAccess,
+        [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle,
+        uint dwProcessId);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "QueryFullProcessImageNameW",
+        StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool QueryFullProcessImageName(
+        nint hProcess,
+        uint dwFlags,
+        char[] lpExeName,
+        ref uint lpdwSize);
+
+    // Sufficient for QueryFullProcessImageName; works even for protected processes.
+    public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 }
 
 // -------------------------------------------------------------------------
@@ -464,20 +523,69 @@ internal static class MspyLog
         }
     }
 
+    // -----------------------------------------------------------------------
+    //  NormalizeFolderPrefix – resolves a user-supplied DOS path such as
+    //  "C:\Foo\Bar" to its NT device form "\Device\HarddiskVolume3\Foo\Bar\"
+    //  so it can be matched against the names the kernel reports.
+    //  Falls back to the original path (with trailing backslash) if the drive
+    //  letter cannot be resolved via QueryDosDevice.
+    // -----------------------------------------------------------------------
+    public static string NormalizeFolderPrefix(string path)
+    {
+        // Normalise separators first
+        path = path.Replace('/', '\\').TrimEnd('\\');
+
+        // Try to resolve a leading drive letter, e.g. "C:" -> "\Device\HarddiskVolume3"
+        if (path.Length >= 2 && char.IsLetter(path[0]) && path[1] == ':')
+        {
+            string drive = path.Substring(0, 2); // "C:"
+            char[] ntBuf = new char[1024];
+            uint len = NativeMethods.QueryDosDevice(drive, ntBuf, (uint)ntBuf.Length);
+            if (len > 2)
+            {
+                // QueryDosDevice returns double-null-terminated list; first entry is what we want
+                string ntDevice = new string(ntBuf).Split('\0', StringSplitOptions.RemoveEmptyEntries)[0];
+                string rest = path.Length > 2 ? path.Substring(2) : string.Empty; // "\Foo\Bar" or ""
+                path = ntDevice + rest;
+            }
+        }
+
+        return path + '\\';
+    }
+
+    // -----------------------------------------------------------------------
+    //  IsMatchingFolder – returns true when name falls under folderPrefix.
+    //  The kernel names look like "\Device\HarddiskVolume3\foo\bar.txt" or
+    //  the DOS-device form "C:\foo\bar.txt".  We do a simple prefix match
+    //  after normalising separators.
+    // -----------------------------------------------------------------------
+    private static bool IsMatchingFolder(string name, string folderPrefix) =>
+        name.StartsWith(folderPrefix, StringComparison.OrdinalIgnoreCase);
+
     public static void ScreenDump(uint sequenceNumber, string name, ref RecordData data)
     {
         string irpMajor = GetIrpString(data.CallbackMajorId, data.CallbackMinorId, out string? irpMinor);
         string originTime = FormatTime(data.OriginatingTime);
         string complTime = data.CompletionTime == 0 ? "" : FormatTime(data.CompletionTime);
+        string statusStr = GetNtStatusName(data.Status);
+        string infoStr = GetInfoString(data.CallbackMajorId, data.Status, data.Information);
+        string processName = GetProcessName(data.ProcessId);
+        string dosPath = ResolveDosPath(name);
 
-        Console.Write($"{sequenceNumber,8:X}: {name,-40} {originTime} {irpMajor,-10} Status={(uint)data.Status:X8} Info={data.Information:X16}");
-
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"Seq={sequenceNumber:X}");
+        sb.Append($"\tPath={dosPath}");
+        sb.Append($"\tPreOp={originTime}");
+        sb.Append($"\tPID={data.ProcessId}:{processName}");
+        sb.Append($"\tIRP={irpMajor}");
         if (!string.IsNullOrEmpty(irpMinor))
-            Console.Write($" ({irpMinor})");
+            sb.Append($"\tMinor={irpMinor}");
+        sb.Append($"\tStatus={statusStr}");
+        sb.Append($"\tInfo={infoStr}");
         if (!string.IsNullOrEmpty(complTime))
-            Console.Write($" Completed={complTime}");
+            sb.Append($"\tPostOp={complTime}");
 
-        Console.WriteLine();
+        Console.WriteLine(sb.ToString());
     }
 
     public static void FileDump(uint sequenceNumber, string name, ref RecordData data, StreamWriter file)
@@ -485,8 +593,9 @@ internal static class MspyLog
         string irpMajor = GetIrpString(data.CallbackMajorId, data.CallbackMinorId, out string? irpMinor);
         string originTime = FormatTime(data.OriginatingTime);
         string complTime = data.CompletionTime == 0 ? "" : FormatTime(data.CompletionTime);
+        string dosPath = ResolveDosPath(name);
 
-        string line = $"{sequenceNumber:X8}\t{name}\t{originTime}\t{irpMajor}\t{irpMinor ?? ""}\t{(uint)data.Status:X8}\t{data.Information:X16}";
+        string line = $"{sequenceNumber:X8}\t{dosPath}\t{originTime}\t{irpMajor}\t{irpMinor ?? ""}\t{(uint)data.Status:X8}\t{data.Information:X16}";
         if (!string.IsNullOrEmpty(complTime))
             line += $"\t{complTime}";
 
@@ -582,6 +691,38 @@ internal static class MspyLog
                         continue;
                     }
 
+                    // -----------------------------------------------------------
+                    //  Folder filter: skip records that don't match the prefix.
+                    //  Snapshot the volatile field once per record for consistency.
+                    // -----------------------------------------------------------
+                    string? folderFilter = context.FolderFilter;
+                    if (folderFilter != null && !IsMatchingFolder(name, folderFilter))
+                    {
+                        cursor += length;
+                        continue;
+                    }
+
+                    // -----------------------------------------------------------
+                    //  Verbose filter: suppress high-frequency infrastructure ops
+                    //  unless /v was specified.
+                    // -----------------------------------------------------------
+                    if (!context.Verbose && IsSuppressedWhenQuiet(data.CallbackMajorId, data.Status))
+                    {
+                        cursor += length;
+                        continue;
+                    }
+
+                    // -----------------------------------------------------------
+                    //  Open-only filter: when /o is active, report only
+                    //  IRP_MJ_CREATE operations that resulted in an open handle
+                    //  (superseded, opened, created, or overwritten).
+                    // -----------------------------------------------------------
+                    if (context.OpenOnly && !IsFileCreateOrOpen(data.CallbackMajorId, data.Status, data.Information))
+                    {
+                        cursor += length;
+                        continue;
+                    }
+
                     if (context.LogToScreen)
                         ScreenDump(seqNum, name, ref data);
 
@@ -620,6 +761,211 @@ internal static class MspyLog
         context.ShutDown?.Release(1);
         Console.WriteLine("Log: All done");
     }
+
+    // -----------------------------------------------------------------------
+    //  GetNtStatusName – returns a short symbolic name for common NTSTATUS
+    //  values, falling back to the raw hex representation.
+    // -----------------------------------------------------------------------
+    private static string GetNtStatusName(int status) => (uint)status switch
+    {
+        0x00000000 => "SUCCESS",
+        0x00000001 => "PENDING",
+        0x00000103 => "NOTIFY_ENUM_DIR",              // Directory change notification buffer filled
+        0x40000000 => "OBJECT_NAME_EXISTS",            // Open succeeded; file already existed
+        0x40000006 => "REPARSE",                       // Reparse point (junction/symlink) encountered
+        0x80000005 => "BUFFER_OVERFLOW",
+        0x80000006 => "NO_MORE_FILES",
+        0xC0000001 => "UNSUCCESSFUL",
+        0xC0000005 => "ACCESS_VIOLATION",
+        0xC0000008 => "INVALID_HANDLE",
+        0xC000000D => "INVALID_PARAMETER",
+        0xC000000F => "NO_SUCH_FILE",
+        0xC0000010 => "INVALID_DEVICE_REQUEST",
+        0xC0000011 => "END_OF_FILE",
+        0xC0000022 => "ACCESS_DENIED",
+        0xC0000033 => "OBJECT_NAME_INVALID",
+        0xC0000034 => "OBJECT_NAME_NOT_FOUND",
+        0xC0000035 => "OBJECT_NAME_COLLISION",
+        0xC0000039 => "OBJECT_PATH_INVALID",
+        0xC000003A => "OBJECT_PATH_NOT_FOUND",
+        0xC0000043 => "SHARING_VIOLATION",
+        0xC0000056 => "DELETE_PENDING",
+        0xC000007F => "DISK_FULL",
+        0xC00000BA => "FILE_IS_A_DIRECTORY",
+        0xC00000D0 => "OPLOCK_NOT_GRANTED",
+        0xC0000101 => "DIRECTORY_NOT_EMPTY",
+        0xC000010A => "DELETE_PENDING",
+        0xC0000120 => "CANCELLED",
+        0xC0000184 => "INVALID_DEVICE_STATE",
+        0xC0000193 => "ACCOUNT_EXPIRED",
+        0xC01C0004 => "NETWORK_QUERY_OPEN_DECLINED",   // Fast I/O declined; I/O manager retries via IRP_MJ_CREATE
+        _ => $"{(uint)status:X8}"
+    };
+
+    // -----------------------------------------------------------------------
+    //  IsSuppressedWhenQuiet – returns true for high-frequency infrastructure
+    //  operations that add noise without actionable signal in normal use:
+    //    • IRP_MJ_NETWORK_QUERY_OPEN declined (fast-path miss before every CREATE)
+    //    • Section-synchronisation acquire/release (paging activity)
+    //    • Mod-write acquire/release (cache manager flushing)
+    //    • CC-flush acquire/release (cache manager flushing)
+    // -----------------------------------------------------------------------
+    private static bool IsSuppressedWhenQuiet(byte major, int status) =>
+        (major == Constants.IrpMjNetworkQueryOpen  && (uint)status == 0xC01C0004) ||
+        major == Constants.IrpMjAcquireForSectionSync ||
+        major == Constants.IrpMjReleaseForSectionSync ||
+        major == Constants.IrpMjAcquireForModWrite     ||
+        major == Constants.IrpMjReleaseForModWrite     ||
+        major == Constants.IrpMjAcquireForCcFlush      ||
+        major == Constants.IrpMjReleaseForCcFlush;
+    
+    // -----------------------------------------------------------------------
+    //  IsOpenOfExistingFile – returns true only when an IRP_MJ_CREATE
+    //  completed with FILE_OPENED (an existing file was opened, not created).
+    // -----------------------------------------------------------------------
+    private static bool IsOpenOfExistingFile(byte major, int status, ulong information) =>
+        major == Constants.IrpMjCreate &&
+        (uint)status == 0x00000000 &&           // STATUS_SUCCESS
+        information == Constants.FileOpened;    // FILE_OPENED == 1
+
+    // -----------------------------------------------------------------------
+    //  IsFileCreateOrOpen – returns true when an IRP_MJ_CREATE completed
+    //  successfully with any of the actionable dispositions:
+    //    FILE_SUPERSEDED (0) – existing file replaced
+    //    FILE_OPENED     (1) – existing file opened
+    //    FILE_CREATED    (2) – new file created
+    //    FILE_OVERWRITTEN(3) – existing file opened and truncated
+    //  FILE_EXISTS (4) and FILE_DOES_NOT_EXIST (5) are probes that did not
+    //  result in an open handle and are excluded.
+    // -----------------------------------------------------------------------
+    private static bool IsFileCreateOrOpen(byte major, int status, ulong information) =>
+        major == Constants.IrpMjCreate &&
+        (uint)status == 0x00000000 &&       // STATUS_SUCCESS
+        information <= Constants.FileOverwritten; // 0..3 all represent an open handle
+    
+
+    // -----------------------------------------------------------------------
+    //  GetInfoString – translates the IoStatus.Information value to a human-
+    //  readable string for the IRP types where it has a well-known meaning.
+    //  Falls back to a 16-digit hex value for all other cases.
+    // -----------------------------------------------------------------------
+    private static string GetInfoString(byte major, int status, ulong information)
+    {
+        if (major == Constants.IrpMjCreate && (uint)status == 0x00000000)
+        {
+            return information switch
+            {
+                Constants.FileSuperseded   => "FILE_SUPERSEDED",
+                Constants.FileOpened       => "FILE_OPENED",
+                Constants.FileCreated      => "FILE_CREATED",
+                Constants.FileOverwritten  => "FILE_OVERWRITTEN",
+                Constants.FileExists       => "FILE_EXISTS",
+                Constants.FileDoesNotExist => "FILE_DOES_NOT_EXIST",
+                _                          => $"{information:X16}"
+            };
+        }
+
+        if (major == Constants.IrpMjRead || major == Constants.IrpMjWrite)
+            return $"{information} bytes";
+
+        return $"{information:X16}";
+    }
+
+    // -----------------------------------------------------------------------
+    //  PID → process name cache.
+    //  Keyed by PID; null value means the name could not be resolved.
+    //  PIDs are recycled by the OS but accurate enough for a monitoring session.
+    // -----------------------------------------------------------------------
+    private static readonly System.Collections.Generic.Dictionary<ulong, string?> s_pidCache = new();
+
+    private static string GetProcessName(ulong pid)
+    {
+        if (!s_pidCache.TryGetValue(pid, out string? cached))
+        {
+            cached = ResolveProcessName(pid);
+            s_pidCache[pid] = cached;
+        }
+        return cached ?? $"{pid}";
+    }
+
+    private static string ResolveProcessName(ulong pid)
+    {
+        if (pid == 0) return "Idle";
+        if (pid == 4) return "System";
+
+        nint handle = NativeMethods.OpenProcess(
+            NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
+
+        if (handle == 0)
+            return null!;
+
+        try
+        {
+            char[] buf = new char[1024];
+            uint size = (uint)buf.Length;
+            if (!NativeMethods.QueryFullProcessImageName(handle, 0, buf, ref size))
+                return null!;
+
+            string full = new string(buf, 0, (int)size);
+            int slash = full.LastIndexOf('\\');
+            return slash >= 0 ? full.Substring(slash + 1) : full;
+        }
+        finally
+        {
+            NativeMethods.CloseHandle(handle);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    //  NT device path → DOS path cache.
+    //  Built once on first use by enumerating all drive letters via
+    //  QueryDosDevice.  Key = NT prefix (e.g. "\Device\HarddiskVolume3"),
+    //  Value = DOS drive letter with colon (e.g. "C:").
+    // -----------------------------------------------------------------------
+    private static System.Collections.Generic.Dictionary<string, string>? s_driveMap;
+
+    private static System.Collections.Generic.Dictionary<string, string> GetDriveMap()
+    {
+        if (s_driveMap != null)
+            return s_driveMap;
+
+        var map = new System.Collections.Generic.Dictionary<string, string>(
+            StringComparer.OrdinalIgnoreCase);
+
+        char[] target = new char[1024];
+        for (char c = 'A'; c <= 'Z'; c++)
+        {
+            string drive = $"{c}:";
+            uint len = NativeMethods.QueryDosDevice(drive, target, (uint)target.Length);
+            if (len > 2)
+            {
+                // QueryDosDevice returns a double-null-terminated list; take the first entry.
+                string ntDevice = new string(target).Split(
+                    '\0', StringSplitOptions.RemoveEmptyEntries)[0];
+                map[ntDevice] = drive;
+            }
+        }
+
+        s_driveMap = map;
+        return map;
+    }
+
+    // -----------------------------------------------------------------------
+    //  ResolveDosPath – converts an NT kernel path such as
+    //  "\Device\HarddiskVolume3\WatchedFolder\x" to its DOS equivalent
+    //  "C:\WatchedFolder\x".  Falls back to the original string when no
+    //  matching drive letter is found.
+    // -----------------------------------------------------------------------
+    private static string ResolveDosPath(string ntPath)
+    {
+        var map = GetDriveMap();
+        foreach (var kvp in map)
+        {
+            if (ntPath.StartsWith(kvp.Key, StringComparison.OrdinalIgnoreCase))
+                return kvp.Value + ntPath.Substring(kvp.Key.Length);
+        }
+        return ntPath;
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -630,6 +976,17 @@ internal sealed class Program
     private static unsafe void DisplayError(int code)
     {
         char[] buffer = new char[260];
+
+        // If this looks like an NTSTATUS (facility != 0 and not a Win32 HRESULT),
+        // convert to a Win32 error code first so FormatMessage can resolve it.
+        // HRESULT Win32 errors have facility 0x7 (0x8007xxxx); pure NTSTATUS values do not.
+        bool isNtStatus = (code & 0x0FFF0000) != 0x00070000 && (uint)code >= 0x80000000u;
+        if (isNtStatus)
+        {
+            uint win32 = NativeMethods.RtlNtStatusToDosError(code);
+            if (win32 != 0x13D) // ERROR_MR_MID_NOT_FOUND means no mapping exists
+                code = NativeMethods.HResultFromWin32((int)win32);
+        }
 
         fixed (char* pBuf = buffer)
         {
@@ -874,11 +1231,27 @@ internal sealed class Program
                         break;
 
                     case 'S':
-                        Console.WriteLine(context.NextLogToScreen
-                            ? "    Turning off logging to screen"
-                            : "    Turning on logging to screen");
-                        context.NextLogToScreen = !context.NextLogToScreen;
-                        break;
+                        {
+                            // /s      – toggle
+                            // /s+     – force on
+                            // /s-     – force off
+                            if (parm.Length >= 3)
+                            {
+                                bool turnOn = parm[2] == '+';
+                                context.NextLogToScreen = turnOn;
+                                Console.WriteLine(turnOn
+                                    ? "    Turning on logging to screen"
+                                    : "    Turning off logging to screen");
+                            }
+                            else
+                            {
+                                Console.WriteLine(context.NextLogToScreen
+                                    ? "    Turning off logging to screen"
+                                    : "    Turning on logging to screen");
+                                context.NextLogToScreen = !context.NextLogToScreen;
+                            }
+                            break;
+                        }
 
                     case 'F':
                         {
@@ -903,6 +1276,42 @@ internal sealed class Program
                             break;
                         }
 
+                    case 'P':
+                        {
+                            // /p <folder>  – set or replace the folder filter
+                            // /p           – clear the folder filter
+                            bool hasArg = (parmIndex + 1 < argv.Length) &&
+                                          argv[parmIndex + 1][0] != '/';
+
+                            if (hasArg)
+                            {
+                                parmIndex++;
+                                string normalized = MspyLog.NormalizeFolderPrefix(argv[parmIndex]);
+                                context.FolderFilter = normalized;
+                                Console.WriteLine($"    Folder filter set to: {normalized}");
+                            }
+                            else
+                            {
+                                context.FolderFilter = null;
+                                Console.WriteLine("    Folder filter cleared – reporting all paths");
+                            }
+                            break;
+                        }
+
+                    case 'V':
+                        context.Verbose = !context.Verbose;
+                        Console.WriteLine(context.Verbose
+                            ? "    Verbose mode on – all operations reported"
+                            : "    Verbose mode off – infrastructure operations suppressed");
+                        break;
+
+                    case 'O':
+                        context.OpenOnly = !context.OpenOnly;
+                        Console.WriteLine(context.OpenOnly
+                            ? "    Create/open mode on – reporting only successful IRP_MJ_CREATE (FILE_SUPERSEDED/OPENED/CREATED/OVERWRITTEN)"
+                            : "    Create/open mode off – reporting all operations");
+                        break;
+
                     default:
                         return PrintUsage();
                 }
@@ -926,12 +1335,19 @@ internal sealed class Program
     private static int PrintUsage()
     {
         Console.WriteLine(
-            "Valid switches: [/a <drive>] [/d <drive>] [/l] [/s] [/f [<file name>]]\n" +
+            "Valid switches: [/a <drive>] [/d <drive>] [/l] [/s] [/f [<file name>]] [/p [<folder>]] [/v] [/o]\n" +
             "    [/a <drive>] starts monitoring <drive>\n" +
             "    [/d <drive> [<instance id>]] detaches filter <instance id> from <drive>\n" +
             "    [/l] lists all the drives the monitor is currently attached to\n" +
             "    [/s] turns on and off showing logging output on the screen\n" +
             "    [/f [<file name>]] turns on and off logging to the specified file\n" +
+            "    [/p [<folder>]] restricts logging to <folder> and its subtree;\n" +
+            "                    omit <folder> to clear the filter and report all paths\n" +
+            "    [/v] toggles verbose mode; when off (default) suppresses\n" +
+            "         IRP_MJ_NETWORK_QUERY_OPEN and section/cache-manager IRPs\n" +
+            "    [/o] toggles create/open mode; when on, reports only successful\n" +
+            "         IRP_MJ_CREATE operations that produced an open handle\n" +
+            "         (FILE_SUPERSEDED, FILE_OPENED, FILE_CREATED, FILE_OVERWRITTEN)\n" +
             "  If you are in command mode:\n" +
             "    [enter] will enter command mode\n" +
             "    [go|g] will exit command mode\n" +
@@ -965,6 +1381,7 @@ internal sealed class Program
             context.LogToScreen = false;
             context.NextLogToScreen = true;
             context.OutputFile = null;
+            context.FolderFilter = null;
 
             if (args.Length > 0)
             {
