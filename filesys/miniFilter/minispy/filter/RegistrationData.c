@@ -38,7 +38,7 @@ CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
       0,
       SpyPreOperationCallback,
       SpyPostOperationCallback },
-
+/*
     { IRP_MJ_CREATE_NAMED_PIPE,
       0,
       SpyPreOperationCallback,
@@ -189,10 +189,10 @@ CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
       SpyPreOperationCallback,
       SpyPostOperationCallback },
 
-/*    { IRP_MJ_NOTIFY_STREAM_FILE_OBJECT,
+    { IRP_MJ_NOTIFY_STREAM_FILE_OBJECT,
       0,
       SpyPreOperationCallback,
-      SpyPostOperationCallback },*/
+      SpyPostOperationCallback },
 
     { IRP_MJ_FAST_IO_CHECK_IF_POSSIBLE,
       0,
@@ -233,7 +233,7 @@ CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
       0,
       SpyPreOperationCallback,
       SpyPostOperationCallback },
-
+*/
     { IRP_MJ_OPERATION_END }
 };
 
