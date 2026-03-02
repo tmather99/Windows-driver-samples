@@ -173,10 +173,17 @@ internal sealed class LogContext
     public Semaphore? ShutDown = null;
 
     /// <summary>
-    /// When non-null, only records whose file name starts with this prefix
-    /// (case-insensitive, path-separator normalised) are reported.
+    /// When non-empty, only records whose file name starts with one of these
+    /// prefixes (case-insensitive, NT device form) are reported.
+    /// Replaced atomically as a snapshot; never mutated in place.
     /// </summary>
-    public volatile string? FolderFilter = null;
+    private volatile string[] _folderFilters = [];
+
+    public string[] FolderFilters
+    {
+        get => _folderFilters;
+        set => _folderFilters = value;
+    }
 
     /// <summary>
     /// When false (default), suppresses noisy fast-path operations such as
@@ -559,8 +566,15 @@ internal static class MspyLog
     //  the DOS-device form "C:\foo\bar.txt".  We do a simple prefix match
     //  after normalising separators.
     // -----------------------------------------------------------------------
-    private static bool IsMatchingFolder(string name, string folderPrefix) =>
-        name.StartsWith(folderPrefix, StringComparison.OrdinalIgnoreCase);
+    private static bool IsMatchingFolder(string name, string[] folderFilters)
+    {
+        foreach (string prefix in folderFilters)
+        {
+            if (name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
 
     public static void ScreenDump(uint sequenceNumber, string name, ref RecordData data)
     {
@@ -692,11 +706,11 @@ internal static class MspyLog
                     }
 
                     // -----------------------------------------------------------
-                    //  Folder filter: skip records that don't match the prefix.
+                    //  Folder filter: skip records that don't match any prefix.
                     //  Snapshot the volatile field once per record for consistency.
                     // -----------------------------------------------------------
-                    string? folderFilter = context.FolderFilter;
-                    if (folderFilter != null && !IsMatchingFolder(name, folderFilter))
+                    string[] folderFilters = context.FolderFilters;
+                    if (folderFilters.Length > 0 && !IsMatchingFolder(name, folderFilters))
                     {
                         cursor += length;
                         continue;
@@ -714,8 +728,8 @@ internal static class MspyLog
 
                     // -----------------------------------------------------------
                     //  Open-only filter: when /o is active, report only
-                    //  IRP_MJ_CREATE operations that resulted in an open handle
-                    //  (superseded, opened, created, or overwritten).
+                    //  IRP_MJ_CREATE operations where an existing file was
+                    //  opened (superseded, opened, created, or overwritten).
                     // -----------------------------------------------------------
                     if (context.OpenOnly && !IsFileCreateOrOpen(data.CallbackMajorId, data.Status, data.Information))
                     {
@@ -1278,8 +1292,8 @@ internal sealed class Program
 
                     case 'P':
                         {
-                            // /p <folder>  – set or replace the folder filter
-                            // /p           – clear the folder filter
+                            // /p <folder>  – add a folder to the filter set
+                            // /p           – clear all folder filters
                             bool hasArg = (parmIndex + 1 < argv.Length) &&
                                           argv[parmIndex + 1][0] != '/';
 
@@ -1287,13 +1301,21 @@ internal sealed class Program
                             {
                                 parmIndex++;
                                 string normalized = MspyLog.NormalizeFolderPrefix(argv[parmIndex]);
-                                context.FolderFilter = normalized;
-                                Console.WriteLine($"    Folder filter set to: {normalized}");
+
+                                // Atomically append by replacing the array snapshot
+                                string[] current = context.FolderFilters;
+                                string[] updated = new string[current.Length + 1];
+                                current.CopyTo(updated, 0);
+                                updated[current.Length] = normalized;
+                                context.FolderFilters = updated;
+
+                                Console.WriteLine($"    Folder filter added: {normalized}");
+                                Console.WriteLine($"    Active filters ({updated.Length}): {string.Join(", ", updated)}");
                             }
                             else
                             {
-                                context.FolderFilter = null;
-                                Console.WriteLine("    Folder filter cleared – reporting all paths");
+                                context.FolderFilters = [];
+                                Console.WriteLine("    All folder filters cleared – reporting all paths");
                             }
                             break;
                         }
@@ -1341,8 +1363,8 @@ internal sealed class Program
             "    [/l] lists all the drives the monitor is currently attached to\n" +
             "    [/s] turns on and off showing logging output on the screen\n" +
             "    [/f [<file name>]] turns on and off logging to the specified file\n" +
-            "    [/p [<folder>]] restricts logging to <folder> and its subtree;\n" +
-            "                    omit <folder> to clear the filter and report all paths\n" +
+            "    [/p <folder>] adds <folder> to the monitored set (cumulative);\n" +
+            "                  omit <folder> to clear all folder filters\n" +
             "    [/v] toggles verbose mode; when off (default) suppresses\n" +
             "         IRP_MJ_NETWORK_QUERY_OPEN and section/cache-manager IRPs\n" +
             "    [/o] toggles create/open mode; when on, reports only successful\n" +
@@ -1381,7 +1403,7 @@ internal sealed class Program
             context.LogToScreen = false;
             context.NextLogToScreen = true;
             context.OutputFile = null;
-            context.FolderFilter = null;
+            context.FolderFilters = Array.Empty<string>();
 
             if (args.Length > 0)
             {
