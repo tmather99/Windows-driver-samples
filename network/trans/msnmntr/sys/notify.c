@@ -100,15 +100,27 @@ MonitorNfParseMessageInbound(
    _In_reads_bytes_(streamLength) BYTE* stream,
    _In_ size_t streamLength,
    _In_ USHORT localPort,
-   _In_ USHORT remotePort)
+   _In_ USHORT remotePort,
+   _In_ ULONG localAddressV4,
+   _In_ ULONG remoteAddressV4,
+   _In_ USHORT ipProto)
 {
    UNREFERENCED_PARAMETER(stream);
 
    DoTraceMessage(TRACE_CLIENT_SERVER,
-               "%Id bytes received. Local Port: %d Remote Port: %d.",
+               "%Id bytes received. Local: %d.%d.%d.%d:%d Remote: %d.%d.%d.%d:%d Proto: %d.",
                streamLength,
+               (localAddressV4 >> 24) & 0xFF,
+               (localAddressV4 >> 16) & 0xFF,
+               (localAddressV4 >> 8) & 0xFF,
+               localAddressV4 & 0xFF,
                localPort,
-               remotePort);
+               (remoteAddressV4 >> 24) & 0xFF,
+               (remoteAddressV4 >> 16) & 0xFF,
+               (remoteAddressV4 >> 8) & 0xFF,
+               remoteAddressV4 & 0xFF,
+               remotePort,
+               ipProto);
    return STATUS_SUCCESS;
 }
 
@@ -117,7 +129,10 @@ MonitorNfParseMessageInboundHttpHeader(
    _In_reads_bytes_(streamLength) BYTE* stream,
    _In_ size_t streamLength,
    _In_ USHORT localPort,
-   _In_ USHORT remotePort)
+   _In_ USHORT remotePort,
+   _In_ ULONG localAddressV4,
+   _In_ ULONG remoteAddressV4,
+   _In_ USHORT ipProto)
 {
    BYTE* msgStart = NULL;
    size_t bytesLeft;
@@ -141,7 +156,10 @@ MonitorNfParseMessageInboundHttpHeader(
       status = MonitorNfParseMessageInbound(msgStart,
                                             msgLength,
                                             localPort,
-                                            remotePort);
+                                            remotePort,
+                                            localAddressV4,
+                                            remoteAddressV4,
+                                            ipProto);
    }
 
    return status;
@@ -152,15 +170,27 @@ MonitorNfParseMessageOutbound(
    _In_reads_bytes_(streamLength) BYTE* stream,
    _In_ size_t streamLength,
    _In_ USHORT localPort,
-   _In_ USHORT remotePort)
+   _In_ USHORT remotePort,
+   _In_ ULONG localAddressV4,
+   _In_ ULONG remoteAddressV4,
+   _In_ USHORT ipProto)
 {
    UNREFERENCED_PARAMETER(stream);
 
    DoTraceMessage(TRACE_CLIENT_SERVER,
-               "%Id bytes sent. Local Port: %d Remote Port: %d.",
+               "%Id bytes sent. Local: %d.%d.%d.%d:%d Remote: %d.%d.%d.%d:%d Proto: %d.",
                streamLength,
+               (localAddressV4 >> 24) & 0xFF,
+               (localAddressV4 >> 16) & 0xFF,
+               (localAddressV4 >> 8) & 0xFF,
+               localAddressV4 & 0xFF,
                localPort,
-               remotePort);
+               (remoteAddressV4 >> 24) & 0xFF,
+               (remoteAddressV4 >> 16) & 0xFF,
+               (remoteAddressV4 >> 8) & 0xFF,
+               remoteAddressV4 & 0xFF,
+               remotePort,
+               ipProto);
    return STATUS_SUCCESS;
 }
 
@@ -169,7 +199,10 @@ MonitorNfParseMessageOutboundHttpHeader(
    _In_reads_bytes_(streamLength) BYTE* stream,
    _In_ size_t streamLength,
    _In_ USHORT localPort,
-   _In_ USHORT remotePort)
+   _In_ USHORT remotePort,
+   _In_ ULONG localAddressV4,
+   _In_ ULONG remoteAddressV4,
+   _In_ USHORT ipProto)
 {
    BYTE* msgStart = NULL;
    size_t bytesLeft;
@@ -191,7 +224,10 @@ MonitorNfParseMessageOutboundHttpHeader(
       status = MonitorNfParseMessageOutbound(msgStart,
                                              msgLength,
                                              localPort,
-                                             remotePort);
+                                             remotePort,
+                                             localAddressV4,
+                                             remoteAddressV4,
+                                             ipProto);
    }
    
    return status;
@@ -203,7 +239,10 @@ MonitorNfParseStreamAndTraceMessage(
    _In_ size_t streamLength,
    _In_ BOOLEAN inbound,
    _In_ USHORT localPort,
-   _In_ USHORT remotePort)
+   _In_ USHORT remotePort,
+   _In_ ULONG localAddressV4,
+   _In_ ULONG remoteAddressV4,
+   _In_ USHORT ipProto)
 {
    NTSTATUS status;
 
@@ -215,7 +254,10 @@ MonitorNfParseStreamAndTraceMessage(
          if ((MonitorNfParseMessageOutboundHttpHeader(stream,
                                                       streamLength,
                                                       localPort,
-                                                      remotePort)) != STATUS_SUCCESS)
+                                                      remotePort,
+                                                      localAddressV4,
+                                                      remoteAddressV4,
+                                                      ipProto)) != STATUS_SUCCESS)
            return STATUS_INSUFFICIENT_RESOURCES; 
       }
       else
@@ -223,7 +265,10 @@ MonitorNfParseStreamAndTraceMessage(
          if ((MonitorNfParseMessageOutbound(stream,
                                             streamLength,
                                             localPort,
-                                            remotePort)!= STATUS_SUCCESS))
+                                            remotePort,
+                                            localAddressV4,
+                                            remoteAddressV4,
+                                            ipProto)!= STATUS_SUCCESS))
            return STATUS_INSUFFICIENT_RESOURCES;
       }
    }
@@ -234,7 +279,10 @@ MonitorNfParseStreamAndTraceMessage(
          if ((MonitorNfParseMessageInboundHttpHeader(stream,
                                                      streamLength,
                                                      localPort,
-                                                     remotePort)) != STATUS_SUCCESS)
+                                                     remotePort,
+                                                     localAddressV4,
+                                                     remoteAddressV4,
+                                                     ipProto)) != STATUS_SUCCESS)
             return STATUS_INSUFFICIENT_RESOURCES;
       }
       else
@@ -242,7 +290,10 @@ MonitorNfParseStreamAndTraceMessage(
          if ((MonitorNfParseMessageInbound(stream,
                                            streamLength,
                                            localPort,
-                                           remotePort)) != STATUS_SUCCESS)
+                                           remotePort,
+                                           localAddressV4,
+                                           remoteAddressV4,
+                                           ipProto)) != STATUS_SUCCESS)
             return STATUS_INSUFFICIENT_RESOURCES;
       }
    }
@@ -254,12 +305,14 @@ MonitorNfParseStreamAndTraceMessage(
    return status;
 }
 
-
 NTSTATUS MonitorNfNotifyMessage(
    _In_ const FWPS_STREAM_DATA* streamBuffer,
    _In_ BOOLEAN inbound,
    _In_ USHORT localPort,
-   _In_ USHORT remotePort
+   _In_ USHORT remotePort,
+   _In_ ULONG localAddressV4,
+   _In_ ULONG remoteAddressV4,
+   _In_ USHORT ipProto
 )
 {
    NTSTATUS status = STATUS_SUCCESS;
@@ -286,9 +339,63 @@ NTSTATUS MonitorNfNotifyMessage(
 
    NT_ASSERT(bytesCopied == streamLength);
 
-   status = MonitorNfParseStreamAndTraceMessage(stream, streamLength, inbound, localPort, remotePort);
+   status = MonitorNfParseStreamAndTraceMessage(stream,
+                                                streamLength,
+                                                inbound,
+                                                localPort,
+                                                remotePort,
+                                                localAddressV4,
+                                                remoteAddressV4,
+                                                ipProto);
 
    ExFreePoolWithTag(stream, TAG_NAME_NOTIFY);
 
    return status;
+}
+
+void MonitorNfNotifyDisconnect(
+   _In_ UINT32 streamFlags,
+   _In_ USHORT localPort,
+   _In_ USHORT remotePort,
+   _In_ ULONG localAddressV4,
+   _In_ ULONG remoteAddressV4,
+   _In_ USHORT ipProto)
+{
+   const char* reason;
+
+   if (streamFlags & FWPS_STREAM_FLAG_SEND_DISCONNECT)
+   {
+      reason = "Send disconnect (FIN)";
+   }
+   else if (streamFlags & FWPS_STREAM_FLAG_RECEIVE_DISCONNECT)
+   {
+      reason = "Receive disconnect (FIN)";
+   }
+   else if (streamFlags & FWPS_STREAM_FLAG_SEND_ABORT)
+   {
+      reason = "Send abort (RST)";
+   }
+   else if (streamFlags & FWPS_STREAM_FLAG_RECEIVE_ABORT)
+   {
+      reason = "Receive abort (RST)";
+   }
+   else
+   {
+      return;
+   }
+
+   DoTraceMessage(TRACE_CLIENT_SERVER,
+               "%s. Local: %d.%d.%d.%d:%d Remote: %d.%d.%d.%d:%d Proto: %s.",
+               reason,
+               (localAddressV4 >> 24) & 0xFF,
+               (localAddressV4 >> 16) & 0xFF,
+               (localAddressV4 >> 8) & 0xFF,
+               localAddressV4 & 0xFF,
+               localPort,
+               (remoteAddressV4 >> 24) & 0xFF,
+               (remoteAddressV4 >> 16) & 0xFF,
+               (remoteAddressV4 >> 8) & 0xFF,
+               remoteAddressV4 & 0xFF,
+               remotePort,
+               MonitorNfProtoToString(ipProto));
 }

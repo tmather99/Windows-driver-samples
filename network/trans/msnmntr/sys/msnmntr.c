@@ -615,6 +615,7 @@ Notes
    NTSTATUS status = STATUS_SUCCESS;
    UINT64   flowHandle;
    UINT64   flowContextLocal;
+   FLOW_DATA* flowData;
 
    UNREFERENCED_PARAMETER(packet);
 #if(NTDDI_VERSION >= NTDDI_WIN7)
@@ -631,6 +632,22 @@ Notes
          classifyOut->actionType = FWP_ACTION_CONTINUE;
          goto cleanup;
       }
+
+      flowData = (FLOW_DATA*)(UINT_PTR)flowContextLocal;
+
+      DoTraceMessage(TRACE_FLOW_ESTABLISHED,
+                     "Flow established. Local: %d.%d.%d.%d:%d Remote: %d.%d.%d.%d:%d Proto: %s.\r\n",
+                     (flowData->localAddressV4 >> 24) & 0xFF,
+                     (flowData->localAddressV4 >> 16) & 0xFF,
+                     (flowData->localAddressV4 >> 8) & 0xFF,
+                     flowData->localAddressV4 & 0xFF,
+                     flowData->localPort,
+                     (flowData->remoteAddressV4 >> 24) & 0xFF,
+                     (flowData->remoteAddressV4 >> 16) & 0xFF,
+                     (flowData->remoteAddressV4 >> 8) & 0xFF,
+                     flowData->remoteAddressV4 & 0xFF,
+                     flowData->remotePort,
+                     MonitorNfProtoToString(flowData->ipProto));
 
       status = FwpsFlowAssociateContext(flowHandle,
                                          FWPS_LAYER_STREAM_V4,
@@ -731,17 +748,38 @@ Notes
 
    streamPacket = (FWPS_STREAM_CALLOUT_IO_PACKET*) packet;
 
-   if (streamPacket->streamData != NULL &&
-       streamPacket->streamData->dataLength != 0)
+   if (streamPacket->streamData != NULL)
    {
       flowData = *(FLOW_DATA**)(UINT64*) &flowContext;
 
       inbound = (BOOLEAN) ((streamPacket->streamData->flags & FWPS_STREAM_FLAG_RECEIVE) == FWPS_STREAM_FLAG_RECEIVE);
 
-      status = MonitorNfNotifyMessage(streamPacket->streamData,
-                                      inbound,
-                                      flowData->localPort,
-                                      flowData->remotePort);
+      //
+      // TCP FIN is indicated by an empty stream with a disconnect flag set.
+      // TCP RST is indicated by an empty stream with an abort flag set.
+      //
+      if (streamPacket->streamData->flags & (FWPS_STREAM_FLAG_SEND_DISCONNECT |
+                                             FWPS_STREAM_FLAG_RECEIVE_DISCONNECT |
+                                             FWPS_STREAM_FLAG_SEND_ABORT |
+                                             FWPS_STREAM_FLAG_RECEIVE_ABORT))
+      {
+         MonitorNfNotifyDisconnect(streamPacket->streamData->flags,
+                                   flowData->localPort,
+                                   flowData->remotePort,
+                                   flowData->localAddressV4,
+                                   flowData->remoteAddressV4,
+                                   flowData->ipProto);
+      }
+      else if (streamPacket->streamData->dataLength != 0)
+      {
+         status = MonitorNfNotifyMessage(streamPacket->streamData,
+                                         inbound,
+                                         flowData->localPort,
+                                         flowData->remotePort,
+                                         flowData->localAddressV4,
+                                         flowData->remoteAddressV4,
+                                         flowData->ipProto);
+      }
    }
 
 cleanup:
