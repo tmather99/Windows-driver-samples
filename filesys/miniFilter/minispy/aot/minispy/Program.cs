@@ -586,18 +586,28 @@ internal static class MspyLog
         string processName = GetProcessName(data.ProcessId);
         string dosPath = ResolveDosPath(name);
 
+        // Show "STATUS:Info" but collapse to just "Info" when status is SUCCESS
+        // to reduce noise in filtered modes where every record is successful.
+        string resultStr = (uint)data.Status == 0x00000000
+            ? infoStr
+            : $"{statusStr}:{infoStr}";
+
+        // Suppress the duplicate "PID=6492:6492" when name resolution failed.
+        string pidStr = processName == $"{data.ProcessId}"
+            ? $"{data.ProcessId}"
+            : $"{data.ProcessId}:{processName}";
+
         var sb = new System.Text.StringBuilder();
-        sb.Append($"Seq={sequenceNumber:X}");
-        sb.Append($"\tPath={dosPath}");
-        sb.Append($"\tPreOp={originTime}");
-        sb.Append($"\tPID={data.ProcessId}:{processName}");
-        sb.Append($"\tIRP={irpMajor}");
+        sb.Append($"Seq={sequenceNumber,-8:X}");
+        sb.Append($"  Path={dosPath,-40}");
+        sb.Append($"  PreOp={originTime}");
+        sb.Append($"  PID={pidStr,-28}");
+        sb.Append($"  IRP={irpMajor,-36}");
         if (!string.IsNullOrEmpty(irpMinor))
-            sb.Append($"\tMinor={irpMinor}");
-        sb.Append($"\tStatus={statusStr}");
-        sb.Append($"\tInfo={infoStr}");
+            sb.Append($"  Minor={irpMinor,-36}");
+        sb.Append($"  Result={resultStr,-20}");
         if (!string.IsNullOrEmpty(complTime))
-            sb.Append($"\tPostOp={complTime}");
+            sb.Append($"  PostOp={complTime}");
 
         Console.WriteLine(sb.ToString());
     }
@@ -609,7 +619,7 @@ internal static class MspyLog
         string complTime = data.CompletionTime == 0 ? "" : FormatTime(data.CompletionTime);
         string dosPath = ResolveDosPath(name);
 
-        string line = $"{sequenceNumber:X8}\t{dosPath}\t{originTime}\t{irpMajor}\t{irpMinor ?? ""}\t{(uint)data.Status:X8}\t{data.Information:X16}";
+        string line = $"{sequenceNumber:X8}\t{dosPath}\t{originTime}\t{irpMajor}\t{irpMinor ?? ""}\t{(uint)data.Status:X8}:{data.Information:X16}";
         if (!string.IsNullOrEmpty(complTime))
             line += $"\t{complTime}";
 
@@ -729,7 +739,7 @@ internal static class MspyLog
                     // -----------------------------------------------------------
                     //  Open-only filter: when /o is active, report only
                     //  IRP_MJ_CREATE operations where an existing file was
-                    //  opened (superseded, opened, created, or overwritten).
+                    //  superseded, opened, created, or overwritten.
                     // -----------------------------------------------------------
                     if (context.OpenOnly && !IsFileCreateOrOpen(data.CallbackMajorId, data.Status, data.Information))
                     {
@@ -970,7 +980,7 @@ internal static class MspyLog
     //  "C:\WatchedFolder\x".  Falls back to the original string when no
     //  matching drive letter is found.
     // -----------------------------------------------------------------------
-    private static string ResolveDosPath(string ntPath)
+    internal static string ResolveDosPath(string ntPath)
     {
         var map = GetDriveMap();
         foreach (var kvp in map)
@@ -1100,7 +1110,7 @@ internal sealed class Program
         return instanceCount;
     }
 
-    private static unsafe void ListDevices()
+    private static unsafe void ListDevices(LogContext context)
     {
         const int bufSize = 1024;
         const int apiBufferSize = bufSize - 2;
@@ -1163,6 +1173,20 @@ internal sealed class Program
                 NativeMethods.FilterVolumeFindClose(volumeIterator);
             NativeMemory.Free(buf);
         }
+
+        // Display monitored path filters
+        string[] filters = context.FolderFilters;
+        Console.WriteLine();
+        if (filters.Length == 0)
+        {
+            Console.WriteLine("Monitored paths: (all paths)");
+        }
+        else
+        {
+            Console.WriteLine($"Monitored paths ({filters.Length}):");
+            foreach (string f in filters)
+                Console.WriteLine($"  {MspyLog.ResolveDosPath(f)}");
+        }
     }
 
     private static int InterpretCommand(string[] argv, LogContext context)
@@ -1201,6 +1225,8 @@ internal sealed class Program
 
                             if (NativeMethods.Succeeded(hr))
                                 Console.WriteLine($"    Instance name: {new string(instanceName).TrimEnd('\0')}");
+                            else if ((uint)hr == 0x801F0012) // ERROR_FLT_INSTANCE_NAME_COLLISION
+                                Console.WriteLine("    Already attached.");
                             else
                             {
                                 Console.WriteLine($"\n    Could not attach to device: 0x{(uint)hr:X8}");
@@ -1208,7 +1234,6 @@ internal sealed class Program
                             }
                             break;
                         }
-
                     case 'D':
                         {
                             parmIndex++;
@@ -1241,7 +1266,7 @@ internal sealed class Program
                         }
 
                     case 'L':
-                        ListDevices();
+                        ListDevices(context);
                         break;
 
                     case 'S':
@@ -1309,8 +1334,8 @@ internal sealed class Program
                                 updated[current.Length] = normalized;
                                 context.FolderFilters = updated;
 
-                                Console.WriteLine($"    Folder filter added: {normalized}");
-                                Console.WriteLine($"    Active filters ({updated.Length}): {string.Join(", ", updated)}");
+                                Console.WriteLine($"    Folder filter added: {MspyLog.ResolveDosPath(normalized)}");
+                                Console.WriteLine($"    Active filters ({updated.Length}): {string.Join(", ", System.Array.ConvertAll(updated, MspyLog.ResolveDosPath))}");
                             }
                             else
                             {
@@ -1415,7 +1440,7 @@ internal sealed class Program
             Thread loggingThread = new Thread(MspyLog.RetrieveLogRecords) { IsBackground = false };
             loggingThread.Start(context);
 
-            ListDevices();
+            ListDevices(context);
 
             Console.WriteLine("\nHit [Enter] to begin command mode...\n");
             Console.Out.Flush();
@@ -1436,7 +1461,7 @@ internal sealed class Program
                 while (returnValue != Constants.ExitInterpreter)
                 {
                     Console.Write(">");
-
+                    returnValue = Constants.Success;
                     string? line = Console.ReadLine();
                     if (line == null) { exitProgram = true; break; }
 
