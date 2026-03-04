@@ -14,6 +14,8 @@ Environment:
 
 #pragma once
 
+#include <wdf.h>
+
 #define TAG_NOTIFY 'yftN'
 
 __forceinline
@@ -55,5 +57,15 @@ void MonitorNfNotifyDisconnect(
    _In_ ULONG localAddressV4,
    _In_ ULONG remoteAddressV4,
    _In_ USHORT ipProto);
+
+void
+MonitorNfNotifyConnect(
+   _In_ const FLOW_DATA* flowData);
+
+NTSTATUS
+MonitorNfDequeueNextEvent(
+   _In_ WDFREQUEST request,
+   _In_ size_t outputBufferLength,
+   _Out_ BOOLEAN* requestCompleted);
 
 

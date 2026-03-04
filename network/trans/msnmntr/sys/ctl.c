@@ -100,6 +100,7 @@ MonitorEvtDeviceControl (
 --*/
 {
    NTSTATUS status = STATUS_SUCCESS;
+   BOOLEAN completed = FALSE;
 
    UNREFERENCED_PARAMETER(Queue);
    UNREFERENCED_PARAMETER(OutputBufferLength);
@@ -139,11 +140,20 @@ MonitorEvtDeviceControl (
          break;
       }
 
+      case MONITOR_IOCTL_DEQUEUE_EVENT:
+      {
+         status = MonitorNfDequeueNextEvent(Request, OutputBufferLength, &completed);
+         break;
+      }
+
       default:
       {
          status = STATUS_INVALID_PARAMETER;
       }
    }
 
-   WdfRequestComplete(Request, status);
+   if (!completed && status != STATUS_PENDING)
+   {
+      WdfRequestComplete(Request, status);
+   }
 }

@@ -658,13 +658,15 @@ Notes
          classifyOut->actionType = FWP_ACTION_CONTINUE;
          goto cleanup;
       }
-   }
 
-   classifyOut->actionType = FWP_ACTION_PERMIT;
-
-   if (filter->flags & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT)
-   {
-      classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+      MonitorNfNotifyConnect(flowData);
+    }
+ 
+    classifyOut->actionType = FWP_ACTION_PERMIT;
+ 
+    if (filter->flags & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT)
+    {
+       classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
    }
 
 cleanup:
