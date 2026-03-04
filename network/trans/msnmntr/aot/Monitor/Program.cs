@@ -1,499 +1,403 @@
-﻿/*
- * C# port of monitor.cpp for the Monitor Sample (msnmntr).
- * Targets .NET 8 with Native AOT.
- * All Win32 / WFP interop uses LibraryImport (source-generated P/Invoke).
- */
+﻿/*++
+
+Copyright (c) Microsoft Corporation. All rights reserved
+
+Abstract:
+
+    Stream monitor sample executable (C# / .NET 8 port of monitor.cpp)
+
+Environment:
+
+    User mode
+
+--*/
 
 using System;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 
-namespace MonitorSample;
-
-// -------------------------------------------------------------------------
-//  Constants (from ioctl.h)
-// -------------------------------------------------------------------------
-internal static class Constants
+// ──────────────────────────────────────────────────────────────
+//  IOCTL codes  (mirror of ioctl.h)
+// ──────────────────────────────────────────────────────────────
+internal static class Ioctl
 {
-    public const string MonitorDosName = @"\\.\MonitorSample";
+    // FILE_DEVICE_NETWORK = 0x12, METHOD_BUFFERED = 0, FILE_ANY_ACCESS = 0
+    // CTL_CODE(t,f,m,a) = (t<<16)|(a<<14)|(f<<2)|m
+    private static uint CtlCode(uint deviceType, uint func, uint method, uint access)
+        => (deviceType << 16) | (access << 14) | (func << 2) | method;
 
-    // CTL_CODE(FILE_DEVICE_NETWORK=0x12, function, METHOD_BUFFERED=0, FILE_ANY_ACCESS=0)
-    // CTL_CODE macro: (DeviceType << 16) | (Access << 14) | (Function << 2) | Method
-    public const uint MonitorIoctlEnableMonitor  = (0x12u << 16) | (0u << 14) | (0x1u << 2) | 0u; // 0x120004
-    public const uint MonitorIoctlDisableMonitor = (0x12u << 16) | (0u << 14) | (0x2u << 2) | 0u; // 0x120008
-    public const uint MonitorIoctlDequeueEvent   = (0x12u << 16) | (0u << 14) | (0x3u << 2) | 0u; // 0x12000C
+    public static readonly uint MONITOR_IOCTL_ENABLE_MONITOR  = CtlCode(0x12, 0x1, 0, 0);
+    public static readonly uint MONITOR_IOCTL_DISABLE_MONITOR = CtlCode(0x12, 0x2, 0, 0);
+    public static readonly uint MONITOR_IOCTL_DEQUEUE_EVENT   = CtlCode(0x12, 0x3, 0, 0);
+
+    public const string MONITOR_DOS_NAME = "\\\\.\\MonitorSample";
 }
 
-// -------------------------------------------------------------------------
-//  Enums (from ioctl.h)
-// -------------------------------------------------------------------------
-internal enum MonitorOperationMode : uint
+// ──────────────────────────────────────────────────────────────
+//  Shared structs / enums  (mirror of ioctl.h)
+// ──────────────────────────────────────────────────────────────
+internal enum MONITOR_OPERATION_MODE : uint
 {
     InvalidOperation = 0,
-    MonitorTraffic = 1,
-    MonitorOperationMax = 2,
-}
-
-internal enum MonitorEventType : uint
-{
-    Invalid = 0,
-    Connect = 1,
-    Disconnect = 2,
-}
-
-// -------------------------------------------------------------------------
-//  Unmanaged structs
-//
-//  MONITOR_SETTINGS (ioctl.h):
-//    { MONITOR_OPERATION_MODE monitorOperation; (4)
-//      UINT32 flags;                            (4) }
-//  Total = 8 bytes, natural alignment = 4.
-//
-//  MONITOR_EVENT (ioctl.h):
-//    { MONITOR_EVENT_TYPE type;   offset  0, size 4
-//      UINT32 flags;              offset  4, size 4
-//      USHORT ipProto;            offset  8, size 2
-//      USHORT localPort;          offset 10, size 2
-//      USHORT remotePort;         offset 12, size 2
-//      [2-byte MSVC padding]      offset 14
-//      ULONG localAddressV4;      offset 16, size 4
-//      ULONG remoteAddressV4;     offset 20, size 4 }
-//  Total = 24 bytes.
-//  The explicit _padding field below reproduces the MSVC structural padding.
-// -------------------------------------------------------------------------
-[StructLayout(LayoutKind.Sequential)]
-internal struct MonitorSettings
-{
-    public MonitorOperationMode MonitorOperation;
-    public uint Flags;
+    MonitorTraffic   = 1,
 }
 
 [StructLayout(LayoutKind.Sequential)]
-internal struct MonitorEvent
+internal struct MONITOR_SETTINGS
 {
-    public MonitorEventType Type;
-    public uint Flags;          // stream flags for disconnect, 0 for connect
-    public ushort IpProto;
-    public ushort LocalPort;
-    public ushort RemotePort;
-    // 2 bytes of MSVC structural padding inserted to align the following ULONG to 4 bytes.
-    // C# Sequential layout does NOT insert this automatically, so we add it explicitly.
-    private ushort _padding;
-    public uint LocalAddressV4;
-    public uint RemoteAddressV4;
-
-    // Compile-time guard: must equal sizeof(MONITOR_EVENT) in ioctl.h (24 bytes).
-    static unsafe MonitorEvent()
-    {
-        if (sizeof(MonitorEvent) != 24)
-            throw new InvalidOperationException(
-                $"MonitorEvent size mismatch: expected 24, got {sizeof(MonitorEvent)}. " +
-                "Check struct padding against MONITOR_EVENT in ioctl.h.");
-    }
+    public MONITOR_OPERATION_MODE monitorOperation;
+    public uint flags;
 }
 
-// -------------------------------------------------------------------------
-//  GUIDs (from mntrguid.h)
-// -------------------------------------------------------------------------
-internal static class MonitorGuids
+internal enum MONITOR_EVENT_TYPE : uint
 {
-    // b3241f1d-7cd2-4e7a-8721-2e97d07702e5
-    public static readonly Guid MonitorSampleSublayer =
-        new(0xb3241f1d, 0x7cd2, 0x4e7a, 0x87, 0x21, 0x2e, 0x97, 0xd0, 0x77, 0x02, 0xe5);
-
-    // 3aaccbc0-2c29-455f-bb91-0e801c8994a4
-    public static readonly Guid MonitorSampleFlowEstablishedCalloutV4 =
-        new(0x3aaccbc0, 0x2c29, 0x455f, 0xbb, 0x91, 0x0e, 0x80, 0x1c, 0x89, 0x94, 0xa4);
-
-    // cea0131a-6ed3-4ed6-b40c-8a8fe8434b0a
-    public static readonly Guid MonitorSampleStreamCalloutV4 =
-        new(0xcea0131a, 0x6ed3, 0x4ed6, 0xb4, 0x0c, 0x8a, 0x8f, 0xe8, 0x43, 0x4b, 0x0a);
+    Invalid    = 0,
+    Connect    = 1,  // monitorEventConnect
+    Disconnect = 2,  // monitorEventDisconnect
 }
 
-// -------------------------------------------------------------------------
-//  WFP interop structures
-//
-//  All layouts use LayoutKind.Explicit to match the native x64 ABI exactly.
-//  Windows SDK: fwpmtypes.h, fwptypes.h
-// -------------------------------------------------------------------------
+// Native MONITOR_EVENT layout (x64):
+//   offset  0: type            UINT32  (4)
+//   offset  4: flags           UINT32  (4)
+//   offset  8: ipProto         USHORT  (2)
+//   offset 10: localPort       USHORT  (2)
+//   offset 12: remotePort      USHORT  (2)
+//   offset 14: <2 bytes pad>         — align ULONG to 4
+//   offset 16: localAddressV4  ULONG   (4)
+//   offset 20: remoteAddressV4 ULONG   (4)
+//   total: 24 bytes
+[StructLayout(LayoutKind.Explicit, Size = 24)]
+internal struct MONITOR_EVENT
+{
+    [FieldOffset( 0)] public MONITOR_EVENT_TYPE type;
+    [FieldOffset( 4)] public uint               flags;
+    [FieldOffset( 8)] public ushort             ipProto;
+    [FieldOffset(10)] public ushort             localPort;
+    [FieldOffset(12)] public ushort             remotePort;
+    [FieldOffset(16)] public uint               localAddressV4;
+    [FieldOffset(20)] public uint               remoteAddressV4;
+}
 
-// FWPM_DISPLAY_DATA0: { PWSTR name; PWSTR description; }
-// x64: 0+8, 8+8 = 16 bytes
+// ──────────────────────────────────────────────────────────────
+//  WFP structs (minimal subset used by this tool)
+// ──────────────────────────────────────────────────────────────
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+internal struct FWPM_DISPLAY_DATA
+{
+    [MarshalAs(UnmanagedType.LPWStr)] public string? name;
+    [MarshalAs(UnmanagedType.LPWStr)] public string? description;
+}
+
+// Blittable twin used inside FWPM_FILTER when the struct is passed via unsafe pointer.
+// The runtime does not marshal embedded structs in unsafe contexts, so string fields
+// must be raw wchar_t* pointers that we pin ourselves.
+[StructLayout(LayoutKind.Sequential)]
+internal struct FWPM_DISPLAY_DATA_NATIVE
+{
+    public IntPtr name;        // pinned wchar_t*
+    public IntPtr description; // pinned wchar_t*
+}
+
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+internal struct FWPM_SESSION
+{
+    public Guid              sessionKey;
+    public FWPM_DISPLAY_DATA displayData;
+    public uint              flags;
+    public uint              txnWaitTimeoutInMSec;
+    public uint              processId;
+    public IntPtr            sid;
+    [MarshalAs(UnmanagedType.LPWStr)] public string? username;
+    [MarshalAs(UnmanagedType.Bool)]   public bool    kernelMode;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FWPM_CALLOUT
+{
+    public Guid             calloutKey;
+    public FWPM_DISPLAY_DATA displayData;
+    public uint             flags;
+    public IntPtr           providerKey;
+    public FWP_BYTE_BLOB    providerData;
+    public Guid             applicableLayer;
+    public uint             calloutId;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FWPM_SUBLAYER
+{
+    public Guid              subLayerKey;
+    public FWPM_DISPLAY_DATA displayData;
+    public uint              flags;
+    public IntPtr            providerKey;
+    public FWP_BYTE_BLOB     providerData;
+    public ushort            weight;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FWP_BYTE_BLOB
+{
+    public uint   size;
+    public IntPtr data;
+}
+
+// FWP_VALUE union — we only need the uint8 / byte-blob variants
+[StructLayout(LayoutKind.Explicit)]
+internal struct FWP_VALUE
+{
+    [FieldOffset(0)] public uint    type;   // FWP_DATA_TYPE
+    [FieldOffset(4)] public byte    uint8;
+    [FieldOffset(4)] public IntPtr  byteBlob; // pointer to FWP_BYTE_BLOB
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FWPM_FILTER_CONDITION
+{
+    public Guid      fieldKey;
+    public uint      matchType;   // FWP_MATCH_TYPE
+    public FWP_VALUE conditionValue;
+}
+
+// FWP_ACTION union
+[StructLayout(LayoutKind.Explicit)]
+internal struct FWPM_ACTION
+{
+    [FieldOffset(0)] public uint type;       // FWP_ACTION_TYPE
+    [FieldOffset(4)] public Guid filterType;
+    [FieldOffset(4)] public Guid calloutKey;
+}
+
+// FWP_VALUE used as weight — native size on x64 is 16:
+// UINT32 type (4) + 4 pad + largest union member (pointer, 8) = 16
 [StructLayout(LayoutKind.Explicit, Size = 16)]
-internal struct FwpmDisplayData0
+internal struct FWP_VALUE0
 {
-    [FieldOffset(0)]  public nint Name;        // PWSTR
-    [FieldOffset(8)]  public nint Description; // PWSTR
+    [FieldOffset(0)] public uint type;
 }
 
-// FWP_BYTE_BLOB: { UINT32 size; UINT8* data; }
-// x64: 0+4, (4 pad) 8+8 = 16 bytes
-[StructLayout(LayoutKind.Explicit, Size = 16)]
-internal struct FwpByteBlob
+[StructLayout(LayoutKind.Explicit)]
+internal unsafe struct FWPM_FILTER
 {
-    [FieldOffset(0)]  public uint Size;
-    [FieldOffset(8)]  public nint Data; // UINT8*
+    [FieldOffset(  0)] public Guid                     filterKey;
+    [FieldOffset( 16)] public FWPM_DISPLAY_DATA_NATIVE displayData;
+    [FieldOffset( 32)] public uint                     flags;
+    // 4 bytes pad at 36 (providerKey is a pointer, aligns to 8)
+    [FieldOffset( 40)] public IntPtr                   providerKey;
+    [FieldOffset( 48)] public FWP_BYTE_BLOB            providerData;
+    [FieldOffset( 64)] public Guid                     layerKey;
+    [FieldOffset( 80)] public Guid                     subLayerKey;
+    [FieldOffset( 96)] public FWP_VALUE0               weight;           // size=16
+    [FieldOffset(112)] public uint                     numFilterConditions;
+    // 4 bytes pad at 116 (filterCondition pointer aligns to 8)
+    [FieldOffset(120)] public FWPM_FILTER_CONDITION*   filterCondition;
+    [FieldOffset(128)] public FWPM_ACTION              action;           // size=20
+    // 4 bytes pad at 148 (rawContext union aligns to 8)
+    [FieldOffset(152)] public ulong                    rawContext;
+    [FieldOffset(168)] public IntPtr                   reserved;
+    [FieldOffset(176)] public ulong                    filterId;
+    [FieldOffset(184)] public FWP_VALUE0               effectiveWeight;  // size=16
 }
 
-// FWP_VALUE0: { FWP_DATA_TYPE type; union { ... largest = UINT64/pointer = 8 }; }
-// x64: 0+4, (4 pad) 8+8 = 16 bytes
-[StructLayout(LayoutKind.Explicit, Size = 16)]
-internal struct FwpValue0
+// OVERLAPPED
+[StructLayout(LayoutKind.Sequential)]
+internal struct OVERLAPPED
 {
-    [FieldOffset(0)]  public uint  Type;   // FWP_DATA_TYPE
-    [FieldOffset(8)]  public ulong Value;  // union – uint8/16/32/64 or pointer
+    public nuint  Internal;
+    public nuint  InternalHigh;
+    public uint   OffsetLow;
+    public uint   OffsetHigh;
+    public IntPtr hEvent;
 }
 
-// FWP_CONDITION_VALUE0: same layout as FWP_VALUE0
-// x64: 0+4, (4 pad) 8+8 = 16 bytes
-[StructLayout(LayoutKind.Explicit, Size = 16)]
-internal struct FwpConditionValue0
-{
-    [FieldOffset(0)]  public uint  Type;   // FWP_DATA_TYPE
-    [FieldOffset(8)]  public ulong Value;  // union
-}
-
-// FWPM_ACTION0: { FWP_ACTION_TYPE type; union { GUID filterType; GUID calloutKey; }; }
-// GUID has 4-byte alignment in MSVC, so the union follows immediately at offset 4.
-// x64: type at 0 (4), calloutKey at 4 (16) = 20 bytes total.
-[StructLayout(LayoutKind.Explicit, Size = 20)]
-internal struct FwpmAction0
-{
-    [FieldOffset(0)]  public uint Type;        // FWP_ACTION_TYPE
-    [FieldOffset(4)]  public Guid CalloutKey;  // union filterType / calloutKey
-}
-
-// FWPM_FILTER_CONDITION0:
-//   { GUID fieldKey;            // offset 0,  size 16
-//     FWP_MATCH_TYPE matchType; // offset 16, size 4 (+4 pad)
-//     FWP_CONDITION_VALUE0;     // offset 24, size 16 }
-// total = 40 bytes
-[StructLayout(LayoutKind.Explicit, Size = 40)]
-internal struct FwpmFilterCondition0
-{
-    [FieldOffset(0)]  public Guid FieldKey;
-    [FieldOffset(16)] public uint MatchType;       // FWP_MATCH_TYPE
-    [FieldOffset(24)] public FwpConditionValue0 ConditionValue;
-}
-
-// FWPM_SESSION0:
-//   { GUID sessionKey;                   // 0,   16
-//     FWPM_DISPLAY_DATA0 displayData;    // 16,  16
-//     UINT32 flags;                      // 32,  4
-//     UINT32 txnWaitTimeoutInMSec;       // 36,  4
-//     DWORD processId;                   // 40,  4 (+4 pad)
-//     SID* sid;                          // 48,  8
-//     PWSTR username;                    // 56,  8
-//     BOOL kernelMode;                   // 64,  4 (+4 pad)
-//   } = 72 bytes
-[StructLayout(LayoutKind.Explicit, Size = 72)]
-internal struct FwpmSession0
-{
-    [FieldOffset(0)]  public Guid SessionKey;
-    [FieldOffset(16)] public FwpmDisplayData0 DisplayData;
-    [FieldOffset(32)] public uint Flags;
-    [FieldOffset(36)] public uint TxnWaitTimeoutInMSec;
-    [FieldOffset(40)] public uint ProcessId;
-    [FieldOffset(48)] public nint Sid;       // PSID
-    [FieldOffset(56)] public nint Username;  // PWSTR
-    [FieldOffset(64)] public int  KernelMode; // BOOL
-}
-
-// FWPM_SUBLAYER0:
-//   { GUID subLayerKey;                  // 0,   16
-//     FWPM_DISPLAY_DATA0 displayData;    // 16,  16
-//     UINT32 flags;                      // 32,  4 (+4 pad)
-//     GUID* providerKey;                 // 40,  8
-//     FWP_BYTE_BLOB providerData;        // 48,  16
-//     UINT16 weight;                     // 64,  2 (+6 pad)
-//   } = 72 bytes
-[StructLayout(LayoutKind.Explicit, Size = 72)]
-internal struct FwpmSublayer0
-{
-    [FieldOffset(0)]  public Guid SubLayerKey;
-    [FieldOffset(16)] public FwpmDisplayData0 DisplayData;
-    [FieldOffset(32)] public uint Flags;
-    [FieldOffset(40)] public nint ProviderKey;     // GUID*
-    [FieldOffset(48)] public FwpByteBlob ProviderData;
-    [FieldOffset(64)] public ushort Weight;
-}
-
-// FWPM_CALLOUT0:
-//   { GUID calloutKey;                   // 0,   16
-//     FWPM_DISPLAY_DATA0 displayData;    // 16,  16
-//     UINT32 flags;                      // 32,  4 (+4 pad)
-//     GUID* providerKey;                 // 40,  8
-//     FWP_BYTE_BLOB providerData;        // 48,  16
-//     GUID applicableLayer;              // 64,  16
-//     UINT32 calloutId;                  // 80,  4 (+4 pad)
-//   } = 88 bytes
-[StructLayout(LayoutKind.Explicit, Size = 88)]
-internal struct FwpmCallout0
-{
-    [FieldOffset(0)]  public Guid CalloutKey;
-    [FieldOffset(16)] public FwpmDisplayData0 DisplayData;
-    [FieldOffset(32)] public uint Flags;
-    [FieldOffset(40)] public nint ProviderKey;     // GUID*
-    [FieldOffset(48)] public FwpByteBlob ProviderData;
-    [FieldOffset(64)] public Guid ApplicableLayer;
-    [FieldOffset(80)] public uint CalloutId;
-}
-
-// -------------------------------------------------------------------------
-//  FWPM_FILTER0 — built as a raw byte buffer via helper methods
-//  to guarantee the exact native x64 layout byte-for-byte.
-//
-//  Native x64 layout (from fwpmtypes.h, verified with MSVC offsetof):
-//    Offset  Field
-//      0     GUID filterKey                          (16)
-//     16     FWPM_DISPLAY_DATA0 displayData          (16)
-//     32     UINT32 flags                            (4 +4 pad)
-//     40     GUID* providerKey                       (8)
-//     48     FWP_BYTE_BLOB providerData              (16)
-//     64     GUID layerKey                           (16)
-//     80     GUID subLayerKey                        (16)
-//     96     FWP_VALUE0 weight                       (16)
-//    112     UINT32 numFilterConditions              (4 +4 pad)
-//    120     FWPM_FILTER_CONDITION0* filterCondition (8)
-//    128     FWPM_ACTION0 action                     (20 +4 pad to 8-align next field)
-//    152     union { UINT64; GUID } context          (16)
-//    168     GUID* reserved                          (8)
-//    176     UINT64 filterId                         (8)
-//    184     FWP_VALUE0 effectiveWeight              (16)
-//    200     total
-// -------------------------------------------------------------------------
-internal static class FwpmFilter0
-{
-    public const int Size = 200;
-
-    // Field offsets
-    public const int FilterKey           = 0;
-    public const int DisplayDataName     = 16;
-    public const int DisplayDataDesc     = 24;
-    public const int Flags               = 32;
-    public const int ProviderKey         = 40;
-    public const int ProviderData        = 48;
-    public const int LayerKey            = 64;
-    public const int SubLayerKey         = 80;
-    public const int WeightType          = 96;
-    public const int WeightValue         = 104;
-    public const int NumFilterConditions = 112;
-    public const int FilterCondition     = 120;
-    public const int ActionType          = 128;
-    // FWPM_ACTION0.calloutKey starts at ActionType+4 (GUID has 4-byte alignment,
-    // immediately follows the 4-byte type field — no padding inserted by MSVC).
-    public const int ActionCalloutKey    = 132;
-    public const int RawContext          = 152;
-    public const int Reserved            = 168;
-    public const int FilterId            = 176;
-    public const int EffectiveWeight     = 184;
-}
-
-// -------------------------------------------------------------------------
-//  WFP constants
-// -------------------------------------------------------------------------
-internal static class Fwpm
-{
-    public const uint SessionFlagDynamic = 0x00000001;
-    public const uint CalloutFlagPersistent = 0x00010000;
-    public const uint RpcCAuthnWinnt = 10;
-
-    // FWP_ACTION_TYPE
-    // FWP_ACTION_FLAG_CALLOUT = 0x00004000
-    // FWP_ACTION_CALLOUT_INSPECTION = 0x00000002 | FWP_ACTION_FLAG_CALLOUT
-    public const uint FwpActionCalloutInspection = 0x00004002;
-
-    // FWP_MATCH_TYPE
-    public const uint FwpMatchEqual = 0;
-
-    // FWP_DATA_TYPE enum (fwptypes.h)
-    //   FWP_EMPTY              = 0
-    //   FWP_UINT8              = 1
-    //   FWP_UINT16             = 2
-    //   FWP_UINT32             = 3
-    //   FWP_UINT64             = 4
-    //   FWP_INT8               = 5
-    //   FWP_INT16              = 6 
-    //   FWP_INT32              = 7
-    //   FWP_INT64              = 8
-    //   FWP_FLOAT              = 9
-    //   FWP_DOUBLE             = 10
-    //   FWP_BYTE_ARRAY16_TYPE  = 11
-    //   FWP_BYTE_BLOB_TYPE     = 12
-    //   FWP_SID                = 13
-    public const uint FwpEmpty = 0;
-    public const uint FwpUint8 = 1;
-    public const uint FwpByteBlobType = 12;
-
-    // WFP error codes (winerror.h)
-    public const uint FwpEAlreadyExists = 0x80320024;
-
-    // FWPM_LAYER GUIDs (from fwpmu.h)
-    // FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4 = c38d57d1-05a7-4c33-904f-7fbceee60e82
-    public static readonly Guid LayerAleFlowEstablishedV4 =
-        new(0xc38d57d1, 0x05a7, 0x4c33, 0x90, 0x4f, 0x7f, 0xbc, 0xee, 0xe6, 0x0e, 0x82);
-
-    // FWPM_LAYER_STREAM_V4 = 3b89653c-c170-49e4-b1cd-e0eeeee19a3e
-    public static readonly Guid LayerStreamV4 =
-        new(0x3b89653c, 0xc170, 0x49e4, 0xb1, 0xcd, 0xe0, 0xee, 0xee, 0xe1, 0x9a, 0x3e);
-
-    // FWPM_CONDITION_IP_PROTOCOL = 3971ef2b-623e-4f9a-8cb1-6e79b806b9a7
-    public static readonly Guid ConditionIpProtocol =
-        new(0x3971ef2b, 0x623e, 0x4f9a, 0x8c, 0xb1, 0x6e, 0x79, 0xb8, 0x06, 0xb9, 0xa7);
-
-    // FWPM_CONDITION_ALE_APP_ID = d78e1e87-8644-4ea5-9437-d809ecefc971
-    public static readonly Guid ConditionAleAppId =
-        new(0xd78e1e87, 0x8644, 0x4ea5, 0x94, 0x37, 0xd8, 0x09, 0xec, 0xef, 0xc9, 0x71);
-
-    public const byte IpProtoTcp = 6;
-}
-
-// -------------------------------------------------------------------------
-//  Native P/Invoke – LibraryImport (source-generated, AOT-safe)
-// -------------------------------------------------------------------------
+// ──────────────────────────────────────────────────────────────
+//  P/Invoke declarations
+// ──────────────────────────────────────────────────────────────
 internal static partial class NativeMethods
 {
-    public static readonly nint InvalidHandleValue = -1;
+    // ── kernel32 ────────────────────────────────────────────
+    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr CreateFileW(
+        string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+        IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+        uint dwFlagsAndAttributes, IntPtr hTemplateFile);
 
-    // kernel32 ----------------------------------------------------------
-    [LibraryImport("kernel32.dll", EntryPoint = "CreateFileW",
-        StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
-    public static partial nint CreateFile(
-        string lpFileName,
-        uint dwDesiredAccess,
-        uint dwShareMode,
-        nint lpSecurityAttributes,
-        uint dwCreationDisposition,
-        uint dwFlagsAndAttributes,
-        nint hTemplateFile);
-
-    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [DllImport("kernel32", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    public static partial bool CloseHandle(nint hObject);
+    public static extern bool CloseHandle(IntPtr hObject);
 
-    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [DllImport("kernel32", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    public static partial bool DeviceIoControl(
-        nint hDevice,
-        uint dwIoControlCode,
-        nint lpInBuffer,
-        uint nInBufferSize,
-        nint lpOutBuffer,
-        uint nOutBufferSize,
+    public static extern unsafe bool DeviceIoControl(
+        IntPtr hDevice, uint dwIoControlCode,
+        void* lpInBuffer, uint nInBufferSize,
+        void* lpOutBuffer, uint nOutBufferSize,
         out uint lpBytesReturned,
-        nint lpOverlapped);
+        OVERLAPPED* lpOverlapped);
 
-    [LibraryImport("kernel32.dll", SetLastError = true)]
-    public static partial nint CreateEventW(
-        nint lpEventAttributes,
-        [MarshalAs(UnmanagedType.Bool)] bool bManualReset,
-        [MarshalAs(UnmanagedType.Bool)] bool bInitialState,
-        nint lpName);
-
-    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [DllImport("kernel32", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    public static partial bool SetEvent(nint hEvent);
-
-    [LibraryImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static partial bool ResetEvent(nint hEvent);
-
-    [LibraryImport("kernel32.dll", SetLastError = true)]
-    public static partial uint WaitForSingleObject(nint hHandle, uint dwMilliseconds);
-
-    [LibraryImport("kernel32.dll", SetLastError = true)]
-    public static partial uint WaitForMultipleObjects(
-        uint nCount,
-        nint lpHandles,      // HANDLE[]
-        [MarshalAs(UnmanagedType.Bool)] bool bWaitAll,
-        uint dwMilliseconds);
-
-    [LibraryImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static partial bool GetOverlappedResult(
-        nint hFile,
-        nint lpOverlapped,
+    public static extern unsafe bool GetOverlappedResult(
+        IntPtr hFile, OVERLAPPED* lpOverlapped,
         out uint lpNumberOfBytesTransferred,
         [MarshalAs(UnmanagedType.Bool)] bool bWait);
 
-    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [DllImport("kernel32", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    public static partial bool CancelIoEx(nint hFile, nint lpOverlapped);
+    public static extern unsafe bool CancelIoEx(IntPtr hFile, OVERLAPPED* lpOverlapped);
 
-    // fwpuclnt.dll (WFP user-mode API) ----------------------------------
-    [LibraryImport("fwpuclnt.dll", SetLastError = true)]
-    public static partial uint FwpmEngineOpen0(
-        nint serverName,            // PCWSTR – NULL for local
-        uint authnService,
-        nint authIdentity,          // SEC_WINNT_AUTH_IDENTITY_W*
-        nint session,               // const FWPM_SESSION0*
-        out nint engineHandle);
+    [DllImport("kernel32", SetLastError = true)]
+    public static extern IntPtr CreateEvent(
+        IntPtr lpEventAttributes,
+        [MarshalAs(UnmanagedType.Bool)] bool bManualReset,
+        [MarshalAs(UnmanagedType.Bool)] bool bInitialState,
+        IntPtr lpName);
 
-    [LibraryImport("fwpuclnt.dll")]
-    public static partial uint FwpmEngineClose0(nint engineHandle);
+    [DllImport("kernel32", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetEvent(IntPtr hEvent);
 
-    [LibraryImport("fwpuclnt.dll")]
-    public static partial uint FwpmTransactionBegin0(nint engineHandle, uint flags);
+    [DllImport("kernel32", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool ResetEvent(IntPtr hEvent);
 
-    [LibraryImport("fwpuclnt.dll")]
-    public static partial uint FwpmTransactionCommit0(nint engineHandle);
+    [DllImport("kernel32", SetLastError = true)]
+    public static extern uint WaitForMultipleObjects(
+        uint nCount, IntPtr[] lpHandles,
+        [MarshalAs(UnmanagedType.Bool)] bool bWaitAll,
+        uint dwMilliseconds);
 
-    [LibraryImport("fwpuclnt.dll")]
-    public static partial uint FwpmTransactionAbort0(nint engineHandle);
+    [DllImport("kernel32", SetLastError = true)]
+    public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
 
-    [LibraryImport("fwpuclnt.dll")]
-    public static partial uint FwpmSubLayerAdd0(
-        nint engineHandle,
-        nint subLayer,              // const FWPM_SUBLAYER0*
-        nint sd);
+    [DllImport("kernel32")]
+    public static extern ulong GetTickCount64();
 
-    [LibraryImport("fwpuclnt.dll")]
-    public static partial uint FwpmCalloutAdd0(
-        nint engineHandle,
-        nint callout,               // const FWPM_CALLOUT0*
-        nint sd,
-        nint id);                   // UINT32* (nullable)
+    [DllImport("kernel32")]
+    public static extern uint GetLastError();
 
-    [LibraryImport("fwpuclnt.dll")]
-    public static partial uint FwpmCalloutDeleteByKey0(
-        nint engineHandle,
-        nint key);                  // const GUID*
+    public const uint GENERIC_READ    = 0x80000000u;
+    public const uint GENERIC_WRITE   = 0x40000000u;
+    public const uint FILE_SHARE_READ  = 0x00000001u;
+    public const uint FILE_SHARE_WRITE = 0x00000002u;
+    public const uint OPEN_EXISTING    = 3;
+    public const uint FILE_FLAG_OVERLAPPED = 0x40000000u;
+    public static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+    public const uint WAIT_OBJECT_0  = 0;
+    public const uint WAIT_TIMEOUT   = 0x102;
+    public const uint INFINITE       = 0xFFFFFFFF;
+    public const uint ERROR_IO_PENDING          = 997;
+    public const uint ERROR_OPERATION_ABORTED   = 995;
 
-    [LibraryImport("fwpuclnt.dll")]
-    public static partial uint FwpmFilterAdd0(
-        nint engineHandle,
-        nint filter,                // const FWPM_FILTER0*
-        nint sd,
-        nint filterId);             // UINT64* (nullable)
+    // ── fwpuclnt ────────────────────────────────────────────
+    [DllImport("fwpuclnt", SetLastError = false, EntryPoint = "FwpmEngineOpen0")]
+    public static extern uint FwpmEngineOpen(
+        IntPtr serverName, uint authnService,
+        IntPtr authIdentity,
+        ref FWPM_SESSION session,
+        out IntPtr engineHandle);
 
-    [LibraryImport("fwpuclnt.dll", EntryPoint = "FwpmGetAppIdFromFileName0",
-        StringMarshalling = StringMarshalling.Utf16)]
-    public static partial uint FwpmGetAppIdFromFileName0(
-        string fileName,
-        out nint appId);        // FWP_BYTE_BLOB**
+    [DllImport("fwpuclnt", SetLastError = false, EntryPoint = "FwpmEngineClose0")]
+    public static extern uint FwpmEngineClose(IntPtr engineHandle);
 
-    [LibraryImport("fwpuclnt.dll")]
-    public static partial void FwpmFreeMemory0(ref nint p);
+    [DllImport("fwpuclnt", SetLastError = false, EntryPoint = "FwpmTransactionBegin0")]
+    public static extern uint FwpmTransactionBegin(IntPtr engineHandle, uint flags);
 
-    // Win32 constants
-    public const uint GenericRead  = 0x80000000;
-    public const uint GenericWrite = 0x40000000;
-    public const uint FileShareRead  = 0x00000001;
-    public const uint FileShareWrite = 0x00000002;
-    public const uint OpenExisting = 3;
-    public const uint FileFlagOverlapped = 0x40000000;
-    public const uint WaitObject0 = 0;
-    public const uint WaitTimeout = 0x00000102;
-    public const uint Infinite = 0xFFFFFFFF;
-    public const int ErrorIoPending = 997;
-    public const int ErrorOperationAborted = 995;
+    [DllImport("fwpuclnt", SetLastError = false, EntryPoint = "FwpmTransactionCommit0")]
+    public static extern uint FwpmTransactionCommit(IntPtr engineHandle);
+
+    [DllImport("fwpuclnt", SetLastError = false, EntryPoint = "FwpmTransactionAbort0")]
+    public static extern uint FwpmTransactionAbort(IntPtr engineHandle);
+
+    [DllImport("fwpuclnt", SetLastError = false, EntryPoint = "FwpmCalloutAdd0")]
+    public static extern uint FwpmCalloutAdd(
+        IntPtr engineHandle, ref FWPM_CALLOUT callout,
+        IntPtr sd, IntPtr id);
+
+    [DllImport("fwpuclnt", SetLastError = false, EntryPoint = "FwpmCalloutDeleteByKey0")]
+    public static extern uint FwpmCalloutDeleteByKey(
+        IntPtr engineHandle, ref Guid calloutKey);
+
+    [DllImport("fwpuclnt", SetLastError = false, EntryPoint = "FwpmSubLayerAdd0")]
+    public static extern uint FwpmSubLayerAdd(
+        IntPtr engineHandle, ref FWPM_SUBLAYER subLayer, IntPtr sd);
+
+    [DllImport("fwpuclnt", SetLastError = false, EntryPoint = "FwpmFilterAdd0")]
+    public static extern unsafe uint FwpmFilterAdd(
+        IntPtr engineHandle, FWPM_FILTER* filter,
+        IntPtr sd, ulong* id);
+
+    [DllImport("fwpuclnt", SetLastError = false, EntryPoint = "FwpmGetAppIdFromFileName0")]
+    public static extern uint FwpmGetAppIdFromFileName(
+        [MarshalAs(UnmanagedType.LPWStr)] string fileName,
+        out IntPtr appId);           // FWP_BYTE_BLOB**
+
+    [DllImport("fwpuclnt", SetLastError = false, EntryPoint = "FwpmFreeMemory0")]
+    public static extern void FwpmFreeMemory(ref IntPtr p);
+
+    // RPC_C_AUTHN_WINNT = 10
+    public const uint RPC_C_AUTHN_WINNT = 10;
+    // FWPM_SESSION_FLAG_DYNAMIC = 0x00000001
+    public const uint FWPM_SESSION_FLAG_DYNAMIC = 0x00000001;
+    // FWP_ACTION_CALLOUT_INSPECTION = 0x4 | FWP_ACTION_FLAG_CALLOUT(0x4000) | FWP_ACTION_FLAG_NON_TERMINATING(0x2000)
+    public const uint FWP_ACTION_CALLOUT_INSPECTION = 0x00006004;
+    // FWP_MATCH_EQUAL = 0
+    public const uint FWP_MATCH_EQUAL = 0;
+    // FWP_DATA_TYPE enum values (fwptypes.h)
+    public const uint FWP_EMPTY          = 0;
+    public const uint FWP_UINT8          = 1;
+    public const uint FWP_BYTE_BLOB_TYPE = 12; // ordinal 12 in FWP_DATA_TYPE enum
+    // FWPM_CALLOUT_FLAG_PERSISTENT = 0x00010000
+    public const uint FWPM_CALLOUT_FLAG_PERSISTENT = 0x00010000;
+    // IPPROTO_TCP = 6
+    public const byte IPPROTO_TCP = 6;
+    // FWP_E_ALREADY_EXISTS   = 0x80320009
+    public const uint FWP_E_ALREADY_EXISTS    = 0x80320009;
+    // FWP_E_BUILTIN_OBJECT   = 0x80320017 — object is built-in and cannot be deleted
+    public const uint FWP_E_BUILTIN_OBJECT    = 0x80320017;
+    // FWP_E_INVALID_ENUMERATOR = 0x8032001d — an enum field contains an out-of-range value;
+    // returned by FwpmFilterAdd when action.type is not a valid FWP_ACTION_TYPE.
+    public const uint FWP_E_INVALID_ENUMERATOR = 0x8032001d;
 }
 
-// -------------------------------------------------------------------------
-//  Formatting helpers
-// -------------------------------------------------------------------------
-internal static class Formatting
+// ──────────────────────────────────────────────────────────────
+//  Well-known GUIDs  (mirror of mntrguid.h)
+// ──────────────────────────────────────────────────────────────
+internal static class MonitorGuids
+{
+    // b3241f1d-7cd2-4e7a-8721-2e97d07702e5
+    public static readonly Guid MONITOR_SAMPLE_SUBLAYER =
+        new Guid(0xb3241f1d, 0x7cd2, 0x4e7a, 0x87, 0x21, 0x2e, 0x97, 0xd0, 0x77, 0x02, 0xe5);
+
+    // 3aaccbc0-2c29-455f-bb91-0e801c8994a4
+    public static readonly Guid MONITOR_SAMPLE_FLOW_ESTABLISHED_CALLOUT_V4 =
+        new Guid(0x3aaccbc0, 0x2c29, 0x455f, 0xbb, 0x91, 0x0e, 0x80, 0x1c, 0x89, 0x94, 0xa4);
+
+    // cea0131a-6ed3-4ed6-b40c-8a8fe8434b0a
+    public static readonly Guid MONITOR_SAMPLE_STREAM_CALLOUT_V4 =
+        new Guid(0xcea0131a, 0x6ed3, 0x4ed6, 0xb4, 0x0c, 0x8a, 0x8f, 0xe8, 0x43, 0x4b, 0x0a);
+
+    // WFP built-in layer GUIDs
+    // FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4 = af80470a-5596-4c13-9992-539e6fe57967
+    public static readonly Guid FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4 =
+        new Guid(0xaf80470a, 0x5596, 0x4c13, 0x99, 0x92, 0x53, 0x9e, 0x6f, 0xe5, 0x79, 0x67);
+
+    // FWPM_LAYER_STREAM_V4 = 3b89653c-c170-49e4-b1cd-e0eeeee19a3e
+    public static readonly Guid FWPM_LAYER_STREAM_V4 =
+        new Guid(0x3b89653c, 0xc170, 0x49e4, 0xb1, 0xcd, 0xe0, 0xee, 0xee, 0xe1, 0x9a, 0x3e);
+
+    // FWPM_CONDITION_IP_PROTOCOL  = 3971ef2b-623e-4f9a-8cb1-6e79b806b9a7
+    public static readonly Guid FWPM_CONDITION_IP_PROTOCOL =
+        new Guid(0x3971ef2b, 0x623e, 0x4f9a, 0x8c, 0xb1, 0x6e, 0x79, 0xb8, 0x06, 0xb9, 0xa7);
+
+    // FWPM_CONDITION_ALE_APP_ID   = d78e1e87-8644-4ea5-9437-d809ecefc971
+    public static readonly Guid FWPM_CONDITION_ALE_APP_ID =
+        new Guid(0xd78e1e87, 0x8644, 0x4ea5, 0x94, 0x37, 0xd8, 0x09, 0xec, 0xef, 0xc9, 0x71);
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Helper formatting functions
+// ──────────────────────────────────────────────────────────────
+internal static class MonitorFormat
 {
     public static string FormatIpv4(uint address)
     {
@@ -520,7 +424,7 @@ internal static class Formatting
         _   => proto.ToString(),
     };
 
-    private static readonly (uint Bit, string Name)[] StreamFlagBits =
+    private static readonly (uint bit, string name)[] s_streamFlagBits =
     [
         (0x00000001, "SEND"),
         (0x00000002, "RECV"),
@@ -536,293 +440,193 @@ internal static class Formatting
     {
         if (flags == 0) return "0";
 
-        var parts = new System.Collections.Generic.List<string>();
+        var sb = new System.Text.StringBuilder();
         uint remaining = flags;
 
-        foreach (var (bit, name) in StreamFlagBits)
+        foreach (var (bit, name) in s_streamFlagBits)
         {
             if ((flags & bit) != 0)
             {
-                parts.Add(name);
+                if (sb.Length > 0) sb.Append('|');
+                sb.Append(name);
                 remaining &= ~bit;
             }
         }
 
         if (remaining != 0)
         {
-            parts.Add($"0x{remaining:x}");
+            if (sb.Length > 0) sb.Append('|');
+            sb.Append($"0x{remaining:x}");
         }
 
-        return string.Join('|', parts);
+        return sb.Length > 0 ? sb.ToString() : "0";
+    }
+
+    public static void PrintEvent(in MONITOR_EVENT evt)
+    {
+        string localAddr  = FormatIpv4(evt.localAddressV4);
+        string remoteAddr = FormatIpv4(evt.remoteAddressV4);
+        string proto      = FormatIpProto(evt.ipProto);
+
+        if (evt.type == MONITOR_EVENT_TYPE.Connect)
+        {
+            Console.WriteLine($"[CONNECT] Proto={proto} Local={localAddr}:{evt.localPort} Remote={remoteAddr}:{evt.remotePort}");
+        }
+        else if (evt.type == MONITOR_EVENT_TYPE.Disconnect)
+        {
+            string flagStr = FormatStreamFlags(evt.flags);
+            Console.WriteLine($"[DISCONNECT] Proto={proto} Flags={flagStr} Local={localAddr}:{evt.localPort} Remote={remoteAddr}:{evt.remotePort}");
+        }
     }
 }
 
-// -------------------------------------------------------------------------
-//  Application logic
-// -------------------------------------------------------------------------
-internal static class MonitorApp
+// ──────────────────────────────────────────────────────────────
+//  Device helpers
+// ──────────────────────────────────────────────────────────────
+internal static class MonitorDevice
 {
-    // -- Unsafe helpers for writing typed values into raw byte buffers ----
-    private static unsafe void WriteGuid(byte* buf, int offset, Guid value)
-        => *(Guid*)(buf + offset) = value;
-
-    private static unsafe void WriteUInt32(byte* buf, int offset, uint value)
-        => *(uint*)(buf + offset) = value;
-
-    private static unsafe void WriteUInt64(byte* buf, int offset, ulong value)
-        => *(ulong*)(buf + offset) = value;
-
-    private static unsafe void WriteUInt8(byte* buf, int offset, byte value)
-        => *(buf + offset) = value;
-
-    private static unsafe void WritePtr(byte* buf, int offset, nint value)
-        => *(nint*)(buf + offset) = value;
-
-    // -- Device open / close ---------------------------------------------
-    public static uint OpenMonitorDevice(out nint monitorDevice)
+    public static (IntPtr handle, uint error) Open()
     {
-        monitorDevice = NativeMethods.CreateFile(
-            Constants.MonitorDosName,
-            NativeMethods.GenericRead | NativeMethods.GenericWrite,
-            NativeMethods.FileShareRead | NativeMethods.FileShareWrite,
-            nint.Zero,
-            NativeMethods.OpenExisting,
-            NativeMethods.FileFlagOverlapped,
-            nint.Zero);
+        IntPtr handle = NativeMethods.CreateFileW(
+            Ioctl.MONITOR_DOS_NAME,
+            NativeMethods.GENERIC_READ | NativeMethods.GENERIC_WRITE,
+            NativeMethods.FILE_SHARE_READ | NativeMethods.FILE_SHARE_WRITE,
+            IntPtr.Zero,
+            NativeMethods.OPEN_EXISTING,
+            NativeMethods.FILE_FLAG_OVERLAPPED,
+            IntPtr.Zero);
 
-        if (monitorDevice == NativeMethods.InvalidHandleValue)
-        {
-            monitorDevice = nint.Zero;
-            return (uint)Marshal.GetLastWin32Error();
-        }
-        return 0; // NO_ERROR
+        if (handle == NativeMethods.INVALID_HANDLE_VALUE)
+            return (IntPtr.Zero, NativeMethods.GetLastError());
+
+        return (handle, 0);
     }
 
-    public static bool CloseMonitorDevice(nint monitorDevice)
-        => NativeMethods.CloseHandle(monitorDevice);
-
-    // -- Enable / Disable monitoring -------------------------------------
-    public static unsafe uint EnableMonitoring(nint monitorDevice, MonitorSettings settings)
+    public static unsafe uint EnableMonitoring(IntPtr device, MONITOR_SETTINGS settings)
     {
-        // The device is opened with FILE_FLAG_OVERLAPPED, so all DeviceIoControl calls
-        // must use a valid OVERLAPPED struct. Passing nint.Zero for lpOverlapped on an
-        // overlapped handle results in undefined behaviour (potential hang / wrong error).
-        // We use a synchronous OVERLAPPED pattern: event is signaled, bWait=true.
-        nint ovEvent = NativeMethods.CreateEventW(nint.Zero, true, false, nint.Zero);
-        if (ovEvent == nint.Zero)
-            return (uint)Marshal.GetLastWin32Error();
-
-        NativeOverlapped ov = default;
-        ov.EventHandle = ovEvent;
-
-        try
+        uint bytes;
+        if (!NativeMethods.DeviceIoControl(
+                device,
+                Ioctl.MONITOR_IOCTL_ENABLE_MONITOR,
+                &settings, (uint)sizeof(MONITOR_SETTINGS),
+                null, 0,
+                out bytes,
+                null))
         {
-            uint bytesReturned;
-            bool ok = NativeMethods.DeviceIoControl(
-                monitorDevice,
-                Constants.MonitorIoctlEnableMonitor,
-                (nint)(&settings),
-                (uint)sizeof(MonitorSettings),
-                nint.Zero,
-                0,
-                out bytesReturned,
-                (nint)Unsafe.AsPointer(ref ov));
-
-            if (!ok)
-            {
-                int err = Marshal.GetLastWin32Error();
-                if (err == NativeMethods.ErrorIoPending)
-                {
-                    // Wait for synchronous-style completion.
-                    if (!NativeMethods.GetOverlappedResult(monitorDevice,
-                            (nint)Unsafe.AsPointer(ref ov), out bytesReturned, true))
-                    {
-                        return (uint)Marshal.GetLastWin32Error();
-                    }
-                }
-                else
-                {
-                    return (uint)err;
-                }
-            }
-            return 0;
+            return NativeMethods.GetLastError();
         }
-        finally
-        {
-            NativeMethods.CloseHandle(ovEvent);
-        }
+        return 0;
     }
 
-    public static unsafe uint DisableMonitoring(nint monitorDevice)
+    public static unsafe uint DisableMonitoring(IntPtr device)
     {
-        // Same overlapped requirement as EnableMonitoring — the handle is FILE_FLAG_OVERLAPPED.
-        nint ovEvent = NativeMethods.CreateEventW(nint.Zero, true, false, nint.Zero);
-        if (ovEvent == nint.Zero)
-            return (uint)Marshal.GetLastWin32Error();
-
-        NativeOverlapped ov = default;
-        ov.EventHandle = ovEvent;
-
-        try
+        uint bytes;
+        if (!NativeMethods.DeviceIoControl(
+                device,
+                Ioctl.MONITOR_IOCTL_DISABLE_MONITOR,
+                null, 0, null, 0, out bytes, null))
         {
-            uint bytesReturned;
-            bool ok = NativeMethods.DeviceIoControl(
-                monitorDevice,
-                Constants.MonitorIoctlDisableMonitor,
-                nint.Zero,
-                0,
-                nint.Zero,
-                0,
-                out bytesReturned,
-                (nint)Unsafe.AsPointer(ref ov));
+            return NativeMethods.GetLastError();
+        }
+        return 0;
+    }
+}
 
-            if (!ok)
-            {
-                int err = Marshal.GetLastWin32Error();
-                if (err == NativeMethods.ErrorIoPending)
-                {
-                    if (!NativeMethods.GetOverlappedResult(monitorDevice,
-                            (nint)Unsafe.AsPointer(ref ov), out bytesReturned, true))
-                    {
-                        return (uint)Marshal.GetLastWin32Error();
-                    }
-                }
-                else
-                {
-                    return (uint)err;
-                }
-            }
-            return 0;
-        }
-        finally
-        {
-            NativeMethods.CloseHandle(ovEvent);
-        }
+// ──────────────────────────────────────────────────────────────
+//  Event-dequeue thread
+// ──────────────────────────────────────────────────────────────
+internal sealed class EventThread : IDisposable
+{
+    private readonly IntPtr _device;
+    private readonly IntPtr _quitEvent;
+    private Thread?  _thread;
+
+    public EventThread(IntPtr device, IntPtr quitEvent)
+    {
+        _device    = device;
+        _quitEvent = quitEvent;
     }
 
-    // -- Print event -----------------------------------------------------
-    public static void PrintEvent(in MonitorEvent evt)
+    public void Start()
     {
-        string localAddr  = Formatting.FormatIpv4(evt.LocalAddressV4);
-        string remoteAddr = Formatting.FormatIpv4(evt.RemoteAddressV4);
-        string proto      = Formatting.FormatIpProto(evt.IpProto);
-
-        if (evt.Type == MonitorEventType.Connect)
-        {
-            Console.WriteLine($"[CONNECT] Proto={proto} Local={localAddr}:{evt.LocalPort} Remote={remoteAddr}:{evt.RemotePort}");
-        }
-        else if (evt.Type == MonitorEventType.Disconnect)
-        {
-            string flagStr = Formatting.FormatStreamFlags(evt.Flags);
-            Console.WriteLine($"[DISCONNECT] Proto={proto} Flags={flagStr} Local={localAddr}:{evt.LocalPort} Remote={remoteAddr}:{evt.RemotePort}");
-        }
+        _thread = new Thread(Run) { IsBackground = true };
+        _thread.Start();
     }
 
-    // -- Stats -----------------------------------------------------------
-    private static void PrintStats(
-        long nowMs,
-        ref long lastPrintMs,
-        ref ulong lastReceived,
-        ulong received,
-        ulong asyncWaits,
-        ulong canceled,
-        ulong syncCompleted)
-    {
-        const long intervalMs = 1000;
-        if (nowMs - lastPrintMs < intervalMs) return;
+    public void Join() => _thread?.Join();
 
-        long elapsedMs = nowMs - lastPrintMs;
-        ulong delta = received - lastReceived;
-        double rate = elapsedMs > 0 ? 1000.0 * delta / elapsedMs : 0.0;
+    public void Dispose() { }
 
-        Console.WriteLine(
-            $"[STATS] rate={rate:F1} ev/s received={received} asyncWaits={asyncWaits} canceled={canceled} syncCompleted={syncCompleted}");
-
-        lastPrintMs = nowMs;
-        lastReceived = received;
-    }
-
-    // -- Event thread ----------------------------------------------------
-    public static unsafe void EventThread(nint monitorDevice, nint quitEvent)
+    private unsafe void Run()
     {
         ulong eventsReceived = 0;
-        ulong asyncWaits = 0;
-        ulong canceled = 0;
-        ulong syncCompleted = 0;
-        long lastPrintMs = Environment.TickCount64;
-        ulong lastReceived = 0;
+        ulong asyncWaits     = 0;
+        ulong canceled       = 0;
+        ulong syncCompleted  = 0;
+        ulong lastPrintMs    = NativeMethods.GetTickCount64();
+        ulong lastReceived   = 0;
 
-        nint ovEvent = NativeMethods.CreateEventW(nint.Zero, true, false, nint.Zero);
-        if (ovEvent == nint.Zero)
-        {
-            Console.WriteLine($"CreateEvent failed: {Marshal.GetLastWin32Error()}");
-            return;
-        }
-
-        NativeOverlapped ov = default;
-        ov.EventHandle = ovEvent;
-
-        // HANDLE[2] for WaitForMultipleObjects
-        nint* waitHandles = stackalloc nint[2];
-        waitHandles[0] = quitEvent;
-        waitHandles[1] = ovEvent;
+        IntPtr ovEvent = NativeMethods.CreateEvent(IntPtr.Zero, true, false, IntPtr.Zero);
+        if (ovEvent == IntPtr.Zero) return;
 
         try
         {
+            OVERLAPPED ov = default;
+            ov.hEvent = ovEvent;
+
+            IntPtr[] waitHandles = [_quitEvent, ovEvent];
+
             while (true)
             {
                 NativeMethods.ResetEvent(ovEvent);
-                MonitorEvent evt = default;
+                MONITOR_EVENT evt = default;
                 uint bytesReturned = 0;
 
                 bool ok = NativeMethods.DeviceIoControl(
-                    monitorDevice,
-                    Constants.MonitorIoctlDequeueEvent,
-                    nint.Zero,
-                    0,
-                    (nint)(&evt),
-                    (uint)sizeof(MonitorEvent),
+                    _device,
+                    Ioctl.MONITOR_IOCTL_DEQUEUE_EVENT,
+                    null, 0,
+                    &evt, (uint)sizeof(MONITOR_EVENT),
                     out bytesReturned,
-                    (nint)Unsafe.AsPointer(ref ov));
+                    &ov);
 
                 if (!ok)
                 {
-                    int err = Marshal.GetLastWin32Error();
-                    if (err == NativeMethods.ErrorIoPending)
+                    uint err = NativeMethods.GetLastError();
+
+                    if (err == NativeMethods.ERROR_IO_PENDING)
                     {
-                        asyncWaits++;
+                        ++asyncWaits;
 
-                        uint wait = NativeMethods.WaitForMultipleObjects(
-                            2, (nint)waitHandles, false, 1000);
+                        uint wait = NativeMethods.WaitForMultipleObjects(2, waitHandles, false, 1000);
 
-                        if (wait == NativeMethods.WaitObject0)
+                        if (wait == NativeMethods.WAIT_OBJECT_0)
                         {
-                            // Shutdown
-                            NativeMethods.CancelIoEx(monitorDevice, (nint)Unsafe.AsPointer(ref ov));
-                            NativeMethods.WaitForSingleObject(ovEvent, NativeMethods.Infinite);
-                            canceled++;
+                            // Shutdown signaled
+                            NativeMethods.CancelIoEx(_device, &ov);
+                            NativeMethods.WaitForSingleObject(ovEvent, NativeMethods.INFINITE);
+                            ++canceled;
                             break;
                         }
-                        else if (wait == NativeMethods.WaitObject0 + 1)
+                        else if (wait == NativeMethods.WAIT_OBJECT_0 + 1)
                         {
-                            // Event arrived
-                            if (!NativeMethods.GetOverlappedResult(monitorDevice, (nint)Unsafe.AsPointer(ref ov), out bytesReturned, false))
+                            if (!NativeMethods.GetOverlappedResult(_device, &ov, out bytesReturned, false))
                             {
-                                err = Marshal.GetLastWin32Error();
-                                if (err == NativeMethods.ErrorOperationAborted)
+                                err = NativeMethods.GetLastError();
+                                if (err == NativeMethods.ERROR_OPERATION_ABORTED)
                                 {
-                                    canceled++;
-                                    PrintStats(Environment.TickCount64, ref lastPrintMs, ref lastReceived,
+                                    ++canceled;
+                                    PrintStats(NativeMethods.GetTickCount64(), ref lastPrintMs, ref lastReceived,
                                                eventsReceived, asyncWaits, canceled, syncCompleted);
                                     continue;
                                 }
                                 break;
                             }
-                            // Fall through to process
+                            // fall through to process bytesReturned
                         }
-                        else if (wait == NativeMethods.WaitTimeout)
+                        else if (wait == NativeMethods.WAIT_TIMEOUT)
                         {
-                            PrintStats(Environment.TickCount64, ref lastPrintMs, ref lastReceived,
+                            PrintStats(NativeMethods.GetTickCount64(), ref lastPrintMs, ref lastReceived,
                                        eventsReceived, asyncWaits, canceled, syncCompleted);
                             continue;
                         }
@@ -831,12 +635,13 @@ internal static class MonitorApp
                             break;
                         }
                     }
-                    else if (err == NativeMethods.ErrorOperationAborted)
+                    else if (err == NativeMethods.ERROR_OPERATION_ABORTED)
                     {
-                        canceled++;
-                        if (NativeMethods.WaitForSingleObject(quitEvent, 0) == NativeMethods.WaitObject0)
+                        ++canceled;
+                        if (NativeMethods.WaitForSingleObject(_quitEvent, 0) == NativeMethods.WAIT_OBJECT_0)
                             break;
-                        PrintStats(Environment.TickCount64, ref lastPrintMs, ref lastReceived,
+
+                        PrintStats(NativeMethods.GetTickCount64(), ref lastPrintMs, ref lastReceived,
                                    eventsReceived, asyncWaits, canceled, syncCompleted);
                         continue;
                     }
@@ -847,16 +652,16 @@ internal static class MonitorApp
                 }
                 else
                 {
-                    syncCompleted++;
+                    ++syncCompleted;
                 }
 
-                if (bytesReturned == (uint)sizeof(MonitorEvent))
+                if (bytesReturned == (uint)sizeof(MONITOR_EVENT))
                 {
-                    eventsReceived++;
-                    PrintEvent(in evt);
+                    ++eventsReceived;
+                    MonitorFormat.PrintEvent(evt);
                 }
 
-                PrintStats(Environment.TickCount64, ref lastPrintMs, ref lastReceived,
+                PrintStats(NativeMethods.GetTickCount64(), ref lastPrintMs, ref lastReceived,
                            eventsReceived, asyncWaits, canceled, syncCompleted);
             }
         }
@@ -866,456 +671,389 @@ internal static class MonitorApp
         }
     }
 
-    // -- Build a 72-byte FWPM_SESSION0 on the native heap ----------------
-    private const int SessionSize = 72;
-
-    private static unsafe nint AllocSession(nint namePtr, nint descPtr, uint flags)
+    private static void PrintStats(
+        ulong nowMs, ref ulong lastPrintMs, ref ulong lastReceived,
+        ulong received, ulong asyncWaits, ulong canceled, ulong syncCompleted)
     {
-        byte* buf = (byte*)NativeMemory.AllocZeroed((nuint)SessionSize);
-        WritePtr(buf, 16, namePtr);     // displayData.name
-        WritePtr(buf, 24, descPtr);     // displayData.description
-        WriteUInt32(buf, 32, flags);    // flags
-        return (nint)buf;
-    }
+        const ulong intervalMs = 1000;
+        if (nowMs - lastPrintMs < intervalMs) return;
 
-    // -- Build an 88-byte FWPM_CALLOUT0 on the native heap ---------------
-    private const int CalloutSize = 88;
+        ulong elapsedMs = nowMs - lastPrintMs;
+        ulong delta     = received - lastReceived;
+        double rate     = elapsedMs != 0 ? 1000.0 * delta / elapsedMs : 0.0;
 
-    private static unsafe nint AllocCallout(Guid calloutKey, nint namePtr, nint descPtr,
-                                             Guid applicableLayer, uint flags)
-    {
-        byte* buf = (byte*)NativeMemory.AllocZeroed((nuint)CalloutSize);
-        WriteGuid(buf, 0, calloutKey);
-        WritePtr(buf, 16, namePtr);
-        WritePtr(buf, 24, descPtr);
-        WriteUInt32(buf, 32, flags);
-        WriteGuid(buf, 64, applicableLayer);
-        return (nint)buf;
-    }
+        Console.WriteLine(
+            $"[STATS] rate={rate:F1} ev/s received={received} asyncWaits={asyncWaits} canceled={canceled} syncCompleted={syncCompleted}");
 
-    // -- Build a 72-byte FWPM_SUBLAYER0 on the native heap ---------------
-    private const int SublayerSize = 72;
-
-    private static unsafe nint AllocSublayer(Guid sublayerKey, nint namePtr, nint descPtr, ushort weight)
-    {
-        byte* buf = (byte*)NativeMemory.AllocZeroed((nuint)SublayerSize);
-        WriteGuid(buf, 0, sublayerKey);
-        WritePtr(buf, 16, namePtr);
-        WritePtr(buf, 24, descPtr);
-        *(ushort*)(buf + 64) = weight;
-        return (nint)buf;
-    }
-
-    // -- Add callouts (persistent, non-dynamic session) ------------------
-    public static unsafe uint AddCallouts()
-    {
-        uint result;
-        nint engineHandle = nint.Zero;
-
-        nint namePtr = Marshal.StringToHGlobalUni("Monitor Sample Non-Dynamic Session");
-        nint descPtr = Marshal.StringToHGlobalUni("For Adding callouts");
-        nint sessionPtr = AllocSession(namePtr, descPtr, 0);
-
-        try
-        {
-            Console.WriteLine("Opening Filtering Engine");
-            result = NativeMethods.FwpmEngineOpen0(nint.Zero, Fwpm.RpcCAuthnWinnt, nint.Zero, sessionPtr, out engineHandle);
-            if (result != 0) return result;
-
-            Console.WriteLine("Starting Transaction for adding callouts");
-            result = NativeMethods.FwpmTransactionBegin0(engineHandle, 0);
-            if (result != 0) { Abort(engineHandle); return result; }
-
-            Console.WriteLine("Successfully started the Transaction");
-
-            // Flow Established callout
-            nint feNamePtr = Marshal.StringToHGlobalUni("Flow Established Callout");
-            nint feDescPtr = Marshal.StringToHGlobalUni("Monitor Sample - Flow Established Callout");
-            nint calloutPtr = AllocCallout(
-                MonitorGuids.MonitorSampleFlowEstablishedCalloutV4,
-                feNamePtr, feDescPtr,
-                Fwpm.LayerAleFlowEstablishedV4,
-                Fwpm.CalloutFlagPersistent);
-
-            Console.WriteLine("Adding Persistent Flow Established callout through the Filtering Engine");
-            result = NativeMethods.FwpmCalloutAdd0(engineHandle, calloutPtr, nint.Zero, nint.Zero);
-            NativeMemory.Free((void*)calloutPtr);
-            Marshal.FreeHGlobal(feNamePtr);
-            Marshal.FreeHGlobal(feDescPtr);
-
-            if (result != 0) { Abort(engineHandle); return result; }
-            Console.WriteLine("Successfully Added Persistent Flow Established callout.");
-
-            // Stream callout
-            nint sNamePtr = Marshal.StringToHGlobalUni("Monitor Sample - Stream Callout");
-            nint sDescPtr = Marshal.StringToHGlobalUni("Monitor Sample - Stream Callout");
-            calloutPtr = AllocCallout(
-                MonitorGuids.MonitorSampleStreamCalloutV4,
-                sNamePtr, sDescPtr,
-                Fwpm.LayerStreamV4,
-                Fwpm.CalloutFlagPersistent);
-
-            Console.WriteLine("Adding Persistent Stream callout through the Filtering Engine");
-            result = NativeMethods.FwpmCalloutAdd0(engineHandle, calloutPtr, nint.Zero, nint.Zero);
-            NativeMemory.Free((void*)calloutPtr);
-            Marshal.FreeHGlobal(sNamePtr);
-            Marshal.FreeHGlobal(sDescPtr);
-
-            if (result != 0) { Abort(engineHandle); return result; }
-            Console.WriteLine("Successfully Added Persistent Stream callout.");
-
-            Console.WriteLine("Committing Transaction");
-            result = NativeMethods.FwpmTransactionCommit0(engineHandle);
-            if (result == 0)
-                Console.WriteLine("Successfully Committed Transaction.");
-
-            return result;
-        }
-        finally
-        {
-            NativeMemory.Free((void*)sessionPtr);
-            Marshal.FreeHGlobal(namePtr);
-            Marshal.FreeHGlobal(descPtr);
-            if (engineHandle != nint.Zero)
-                NativeMethods.FwpmEngineClose0(engineHandle);
-        }
-    }
-
-    // -- Remove callouts -------------------------------------------------
-    public static unsafe uint RemoveCallouts()
-    {
-        uint result;
-        nint engineHandle = nint.Zero;
-
-        nint namePtr = Marshal.StringToHGlobalUni("Monitor Sample Non-Dynamic Session");
-        nint descPtr = Marshal.StringToHGlobalUni("For Adding callouts");
-        nint sessionPtr = AllocSession(namePtr, descPtr, 0);
-
-        try
-        {
-            Console.WriteLine("Opening Filtering Engine");
-            result = NativeMethods.FwpmEngineOpen0(nint.Zero, Fwpm.RpcCAuthnWinnt, nint.Zero, sessionPtr, out engineHandle);
-            if (result != 0) return result;
-
-            Console.WriteLine("Starting Transaction for Removing callouts");
-            result = NativeMethods.FwpmTransactionBegin0(engineHandle, 0);
-            if (result != 0) { Abort(engineHandle); return result; }
-            Console.WriteLine("Successfully started the Transaction");
-
-            Guid feKey = MonitorGuids.MonitorSampleFlowEstablishedCalloutV4;
-            Console.WriteLine("Deleting Flow Established callout");
-            result = NativeMethods.FwpmCalloutDeleteByKey0(engineHandle, (nint)Unsafe.AsPointer(ref feKey));
-            if (result != 0) { Abort(engineHandle); return result; }
-            Console.WriteLine("Successfully Deleted Flow Established callout");
-
-            Guid sKey = MonitorGuids.MonitorSampleStreamCalloutV4;
-            Console.WriteLine("Deleting Stream callout");
-            result = NativeMethods.FwpmCalloutDeleteByKey0(engineHandle, (nint)Unsafe.AsPointer(ref sKey));
-            if (result != 0) { Abort(engineHandle); return result; }
-            Console.WriteLine("Successfully Deleted Stream callout");
-
-            Console.WriteLine("Committing Transaction");
-            result = NativeMethods.FwpmTransactionCommit0(engineHandle);
-            if (result == 0)
-                Console.WriteLine("Successfully Committed Transaction.");
-
-            return result;
-        }
-        finally
-        {
-            NativeMemory.Free((void*)sessionPtr);
-            Marshal.FreeHGlobal(namePtr);
-            Marshal.FreeHGlobal(descPtr);
-            if (engineHandle != nint.Zero)
-                NativeMethods.FwpmEngineClose0(engineHandle);
-        }
-    }
-
-    // -- Add WFP filters (dynamic session) --------------------------------
-    public static unsafe uint AddFilters(nint engineHandle, nint applicationId)
-    {
-        uint result;
-
-        nint slNamePtr = Marshal.StringToHGlobalUni("Monitor Sample Sub layer");
-        nint slDescPtr = Marshal.StringToHGlobalUni("Monitor Sample Sub layer");
-
-        nint feFilterName = Marshal.StringToHGlobalUni("Flow established filter.");
-        nint feFilterDesc = Marshal.StringToHGlobalUni("Sets up flow for traffic that we are interested in.");
-        nint stFilterName = Marshal.StringToHGlobalUni("Stream Layer Filter");
-        nint stFilterDesc = Marshal.StringToHGlobalUni("Monitors TCP traffic.");
-
-        nint sublayerPtr = AllocSublayer(MonitorGuids.MonitorSampleSublayer, slNamePtr, slDescPtr, 0);
-
-        // Allocate filter conditions on native heap (2 × 40 = 80 bytes)
-        byte* conditions = (byte*)NativeMemory.AllocZeroed(2 * 40);
-
-        // Allocate FWPM_FILTER0 on native heap (200 bytes)
-        byte* filterBuf = (byte*)NativeMemory.AllocZeroed((nuint)FwpmFilter0.Size);
-
-        try
-        {
-            Console.WriteLine("Starting Transaction");
-            result = NativeMethods.FwpmTransactionBegin0(engineHandle, 0);
-            if (result != 0) { Abort(engineHandle); return result; }
-            Console.WriteLine("Successfully Started Transaction");
-
-            // Sublayer
-            Console.WriteLine("Adding Sublayer");
-            result = NativeMethods.FwpmSubLayerAdd0(engineHandle, sublayerPtr, nint.Zero);
-            if (result != 0 && result != Fwpm.FwpEAlreadyExists)
-            {
-                Abort(engineHandle); return result;
-            }
-            if (result == Fwpm.FwpEAlreadyExists)
-                Console.WriteLine("Sublayer already exists — continuing");
-            else
-                Console.WriteLine("Successfully added Sublayer");
-
-            // --- Build filter conditions ---
-            // Condition 0: IP_PROTOCOL == TCP
-            byte* cond0 = conditions;
-            WriteGuid(cond0, 0, Fwpm.ConditionIpProtocol);    // fieldKey
-            WriteUInt32(cond0, 16, Fwpm.FwpMatchEqual);        // matchType
-            WriteUInt32(cond0, 24, Fwpm.FwpUint8);             // conditionValue.type
-            WriteUInt8(cond0, 32, Fwpm.IpProtoTcp);            // conditionValue.uint8 (union)
-
-            uint numConditions = 1;
-
-            if (applicationId != nint.Zero)
-            {
-                // Condition 1: ALE_APP_ID == applicationPath
-                byte* cond1 = conditions + 40;
-                WriteGuid(cond1, 0, Fwpm.ConditionAleAppId);
-                WriteUInt32(cond1, 16, Fwpm.FwpMatchEqual);
-                WriteUInt32(cond1, 24, Fwpm.FwpByteBlobType);
-                WriteUInt64(cond1, 32, (ulong)applicationId);
-                numConditions = 2;
-            }
-
-            // --- Flow Established filter ---
-            NativeMemory.Clear(filterBuf, (nuint)FwpmFilter0.Size);
-            var feFilterKey = Guid.NewGuid();
-            WriteGuid(filterBuf,   FwpmFilter0.FilterKey,           feFilterKey);
-            WritePtr(filterBuf,    FwpmFilter0.DisplayDataName,     feFilterName);
-            WritePtr(filterBuf,    FwpmFilter0.DisplayDataDesc,     feFilterDesc);
-            WriteGuid(filterBuf,   FwpmFilter0.LayerKey,            Fwpm.LayerAleFlowEstablishedV4);
-            WriteGuid(filterBuf,   FwpmFilter0.SubLayerKey,         MonitorGuids.MonitorSampleSublayer);
-            WriteUInt32(filterBuf, FwpmFilter0.WeightType,          Fwpm.FwpEmpty);
-            WriteUInt32(filterBuf, FwpmFilter0.NumFilterConditions, numConditions);
-            WritePtr(filterBuf,    FwpmFilter0.FilterCondition,     (nint)conditions);
-            WriteUInt32(filterBuf, FwpmFilter0.ActionType,          Fwpm.FwpActionCalloutInspection);
-            WriteGuid(filterBuf,   FwpmFilter0.ActionCalloutKey,    MonitorGuids.MonitorSampleFlowEstablishedCalloutV4);
-
-            Console.WriteLine(applicationId != nint.Zero
-                ? "Adding Flow Established Filter (app-scoped)"
-                : "Adding Flow Established Filter (all processes)");
-
-            result = NativeMethods.FwpmFilterAdd0(engineHandle, (nint)filterBuf, nint.Zero, nint.Zero);
-            if (result != 0 && result != Fwpm.FwpEAlreadyExists) { Abort(engineHandle); return result; }
-            Console.WriteLine(result == Fwpm.FwpEAlreadyExists
-                ? "Flow Established filter already exists — continuing"
-                : "Successfully added Flow Established filter");
-
-            // --- Stream filter ---
-            // numFilterConditions=0 and filterCondition=NULL is valid per WFP spec;
-            // the native C++ reference code uses a non-null pointer here only because
-            // it reuses a stack buffer — the count=0 means the pointer is ignored by the engine.
-            NativeMemory.Clear(filterBuf, (nuint)FwpmFilter0.Size);
-            var stFilterKey = Guid.NewGuid();
-            WriteGuid(filterBuf,   FwpmFilter0.FilterKey,           stFilterKey);
-            WritePtr(filterBuf,    FwpmFilter0.DisplayDataName,     stFilterName);
-            WritePtr(filterBuf,    FwpmFilter0.DisplayDataDesc,     stFilterDesc);
-            WriteGuid(filterBuf,   FwpmFilter0.LayerKey,            Fwpm.LayerStreamV4);
-            WriteGuid(filterBuf,   FwpmFilter0.SubLayerKey,         MonitorGuids.MonitorSampleSublayer);
-            WriteUInt32(filterBuf, FwpmFilter0.WeightType,          Fwpm.FwpEmpty);
-            WriteUInt32(filterBuf, FwpmFilter0.NumFilterConditions, 0);
-            // filterCondition pointer is left NULL (zeroed buffer) — valid when numFilterConditions=0.
-            WriteUInt32(filterBuf, FwpmFilter0.ActionType,          Fwpm.FwpActionCalloutInspection);
-            WriteGuid(filterBuf,   FwpmFilter0.ActionCalloutKey,    MonitorGuids.MonitorSampleStreamCalloutV4);
-
-            Console.WriteLine("Adding Stream Filter");
-            result = NativeMethods.FwpmFilterAdd0(engineHandle, (nint)filterBuf, nint.Zero, nint.Zero);
-            if (result != 0 && result != Fwpm.FwpEAlreadyExists) { Abort(engineHandle); return result; }
-            Console.WriteLine(result == Fwpm.FwpEAlreadyExists
-                ? "Stream filter already exists — continuing"
-                : "Successfully added Stream filter");
-
-            Console.WriteLine("Committing Transaction");
-            result = NativeMethods.FwpmTransactionCommit0(engineHandle);
-            if (result == 0)
-                Console.WriteLine("Successfully Committed Transaction");
-
-            return result;
-        }
-        finally
-        {
-            NativeMemory.Free(filterBuf);
-            NativeMemory.Free(conditions);
-            NativeMemory.Free((void*)sublayerPtr);
-            Marshal.FreeHGlobal(slNamePtr);
-            Marshal.FreeHGlobal(slDescPtr);
-            Marshal.FreeHGlobal(feFilterName);
-            Marshal.FreeHGlobal(feFilterDesc);
-            Marshal.FreeHGlobal(stFilterName);
-            Marshal.FreeHGlobal(stFilterDesc);
-        }
-    }
-
-    // -- Main monitoring flow --------------------------------------------
-    public static unsafe uint DoMonitoring(string? appPath)
-    {
-        nint monitorDevice = nint.Zero;
-        nint engineHandle = nint.Zero;
-        nint applicationId = nint.Zero;
-        nint quitEvent = nint.Zero;
-        Thread? eventThread = null;
-        uint result = 0;
-
-        nint sNamePtr = Marshal.StringToHGlobalUni("Monitor Sample Session");
-        nint sDescPtr = Marshal.StringToHGlobalUni("Monitors traffic at the Stream layer.");
-        nint sessionPtr = AllocSession(sNamePtr, sDescPtr, Fwpm.SessionFlagDynamic);
-
-        try
-        {
-            Console.WriteLine("Opening Filtering Engine");
-            result = NativeMethods.FwpmEngineOpen0(nint.Zero, Fwpm.RpcCAuthnWinnt, nint.Zero, sessionPtr, out engineHandle);
-
-            if (result != 0) return result;
-            Console.WriteLine("Successfully opened Filtering Engine");
-
-            if (appPath != null)
-            {
-                Console.WriteLine("Looking up Application ID from BFE");
-                result = NativeMethods.FwpmGetAppIdFromFileName0(appPath, out applicationId);
-                if (result != 0) return result;
-                Console.WriteLine("Successfully retrieved Application ID");
-            }
-            else
-            {
-                Console.WriteLine("No application path specified — monitoring all processes");
-            }
-
-            Console.WriteLine("Opening Monitor Sample Device");
-            result = OpenMonitorDevice(out monitorDevice);
-            if (result != 0) return result;
-            Console.WriteLine("Successfully opened Monitor Device");
-
-            Console.WriteLine("Adding Filters through the Filtering Engine");
-            result = AddFilters(engineHandle, applicationId);
-            if (result != 0) return result;
-            Console.WriteLine("Successfully added Filters through the Filtering Engine");
-
-            Console.WriteLine("Enabling monitoring through the Monitor Sample Device");
-            var settings = new MonitorSettings
-            {
-                MonitorOperation = MonitorOperationMode.MonitorTraffic,
-            };
-            result = EnableMonitoring(monitorDevice, settings);
-            if (result != 0) return result;
-            Console.WriteLine("Successfully enabled monitoring.");
-
-            quitEvent = NativeMethods.CreateEventW(nint.Zero, true, false, nint.Zero);
-            if (quitEvent == nint.Zero)
-            {
-                result = (uint)Marshal.GetLastWin32Error();
-                return result;
-            }
-
-            // Capture for the thread closure
-            nint dev = monitorDevice;
-            nint quit = quitEvent;
-            eventThread = new Thread(() => EventThread(dev, quit))
-            {
-                IsBackground = true,
-                Name = "MonitorEventThread",
-            };
-            eventThread.Start();
-
-            Console.WriteLine("Monitoring... press any key to exit and cleanup filters.");
-            Console.ReadKey(intercept: true);
-
-            NativeMethods.SetEvent(quitEvent);
-            NativeMethods.CancelIoEx(monitorDevice, nint.Zero);
-            eventThread.Join();
-
-            return 0;
-        }
-        finally
-        {
-            if (result != 0)
-                Console.WriteLine($"Monitor.\tError 0x{result:x} occurred during execution");
-
-            NativeMemory.Free((void*)sessionPtr);
-            Marshal.FreeHGlobal(sNamePtr);
-            Marshal.FreeHGlobal(sDescPtr);
-
-            if (quitEvent != nint.Zero)
-                NativeMethods.CloseHandle(quitEvent);
-
-            if (monitorDevice != nint.Zero)
-                CloseMonitorDevice(monitorDevice);
-
-            if (applicationId != nint.Zero)
-                NativeMethods.FwpmFreeMemory0(ref applicationId);
-
-            if (engineHandle != nint.Zero)
-                NativeMethods.FwpmEngineClose0(engineHandle);
-        }
-    }
-
-    // -- Helpers ---------------------------------------------------------
-    private static void Abort(nint engineHandle)
-    {
-        Console.WriteLine("Aborting Transaction");
-        uint r = NativeMethods.FwpmTransactionAbort0(engineHandle);
-        if (r == 0)
-            Console.WriteLine("Successfully Aborted Transaction.");
+        lastPrintMs   = nowMs;
+        lastReceived  = received;
     }
 }
 
-// -------------------------------------------------------------------------
-//  Entry point
-// -------------------------------------------------------------------------
-internal static class Program
+// ──────────────────────────────────────────────────────────────
+//  WFP callout management
+// ──────────────────────────────────────────────────────────────
+internal static class MonitorCallouts
 {
-    private static void PrintUsage()
+    private const string FLOW_ESTABLISHED_CALLOUT_NAME        = "Flow Established Callout";
+    private const string FLOW_ESTABLISHED_CALLOUT_DESCRIPTION = "Monitor Sample - Flow Established Callout";
+    private const string STREAM_CALLOUT_NAME                  = "Stream Callout";
+    private const string STREAM_CALLOUT_DESCRIPTION           = "Monitor Sample - Stream Callout";
+
+    public static uint Add()
     {
-        Console.WriteLine("Usage: monitor ( addcallouts | delcallouts | monitor [targetApp.exe] )");
+        var session = new FWPM_SESSION
+        {
+            displayData = new FWPM_DISPLAY_DATA
+            {
+                name        = "Monitor Sample Non-Dynamic Session",
+                description = "For Adding callouts",
+            }
+        };
+
+        Console.WriteLine("Opening Filtering Engine");
+        uint result = NativeMethods.FwpmEngineOpen(IntPtr.Zero, NativeMethods.RPC_C_AUTHN_WINNT,
+                                                   IntPtr.Zero, ref session, out IntPtr engine);
+        if (result != 0) return result;
+
+        Console.WriteLine("Starting Transaction for adding callouts");
+        result = NativeMethods.FwpmTransactionBegin(engine, 0);
+        if (result != 0) { Abort(engine, "abort"); goto cleanup; }
+
+        Console.WriteLine("Successfully started the Transaction");
+
+        var callout = new FWPM_CALLOUT
+        {
+            calloutKey      = MonitorGuids.MONITOR_SAMPLE_FLOW_ESTABLISHED_CALLOUT_V4,
+            displayData     = new FWPM_DISPLAY_DATA { name = FLOW_ESTABLISHED_CALLOUT_NAME, description = FLOW_ESTABLISHED_CALLOUT_DESCRIPTION },
+            applicableLayer = MonitorGuids.FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4,
+            flags           = NativeMethods.FWPM_CALLOUT_FLAG_PERSISTENT,
+        };
+
+        Console.WriteLine("Adding Persistent Flow Established callout through the Filtering Engine");
+        result = NativeMethods.FwpmCalloutAdd(engine, ref callout, IntPtr.Zero, IntPtr.Zero);
+        if (result != 0) { Abort(engine, "abort"); goto cleanup; }
+        Console.WriteLine("Successfully Added Persistent Flow Established callout.");
+
+        callout = new FWPM_CALLOUT
+        {
+            calloutKey      = MonitorGuids.MONITOR_SAMPLE_STREAM_CALLOUT_V4,
+            displayData     = new FWPM_DISPLAY_DATA { name = STREAM_CALLOUT_NAME, description = STREAM_CALLOUT_DESCRIPTION },
+            applicableLayer = MonitorGuids.FWPM_LAYER_STREAM_V4,
+            flags           = NativeMethods.FWPM_CALLOUT_FLAG_PERSISTENT,
+        };
+
+        Console.WriteLine("Adding Persistent Stream callout through the Filtering Engine");
+        result = NativeMethods.FwpmCalloutAdd(engine, ref callout, IntPtr.Zero, IntPtr.Zero);
+        if (result != 0) { Abort(engine, "abort"); goto cleanup; }
+        Console.WriteLine("Successfully Added Persistent Stream callout.");
+
+        Console.WriteLine("Committing Transaction");
+        result = NativeMethods.FwpmTransactionCommit(engine);
+        if (result == 0) Console.WriteLine("Successfully Committed Transaction.");
+        goto cleanup;
+
+    cleanup:
+        NativeMethods.FwpmEngineClose(engine);
+        return result;
     }
 
-    private static int Main(string[] args)
+    public static uint Remove()
+    {
+        var session = new FWPM_SESSION
+        {
+            displayData = new FWPM_DISPLAY_DATA
+            {
+                name        = "Monitor Sample Non-Dynamic Session",
+                description = "For Adding callouts",
+            }
+        };
+
+        Console.WriteLine("Opening Filtering Engine");
+        uint result = NativeMethods.FwpmEngineOpen(IntPtr.Zero, NativeMethods.RPC_C_AUTHN_WINNT,
+                                                   IntPtr.Zero, ref session, out IntPtr engine);
+        if (result != 0) return result;
+
+        Console.WriteLine("Starting Transaction for Removing callouts");
+        result = NativeMethods.FwpmTransactionBegin(engine, 0);
+        if (result != 0) { Abort(engine, ""); goto cleanup; }
+        Console.WriteLine("Successfully started the Transaction");
+
+        Console.WriteLine("Deleting Flow Established callout");
+        Guid feKey = MonitorGuids.MONITOR_SAMPLE_FLOW_ESTABLISHED_CALLOUT_V4;
+        result = NativeMethods.FwpmCalloutDeleteByKey(engine, ref feKey);
+        if (result != 0) { Abort(engine, ""); goto cleanup; }
+        Console.WriteLine("Successfully Deleted Flow Established callout");
+
+        Console.WriteLine("Deleting Stream callout");
+        Guid scKey = MonitorGuids.MONITOR_SAMPLE_STREAM_CALLOUT_V4;
+        result = NativeMethods.FwpmCalloutDeleteByKey(engine, ref scKey);
+        if (result != 0) { Abort(engine, ""); goto cleanup; }
+        Console.WriteLine("Successfully Deleted Stream callout");
+
+        Console.WriteLine("Committing Transaction");
+        result = NativeMethods.FwpmTransactionCommit(engine);
+        if (result == 0) Console.WriteLine("Successfully Committed Transaction.");
+        goto cleanup;
+
+    cleanup:
+        NativeMethods.FwpmEngineClose(engine);
+        return result;
+    }
+
+    private static void Abort(IntPtr engine, string _)
+    {
+        Console.WriteLine("Aborting Transaction");
+        uint r = NativeMethods.FwpmTransactionAbort(engine);
+        if (r == 0) Console.WriteLine("Successfully Aborted Transaction.");
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+//  WFP filter management
+// ──────────────────────────────────────────────────────────────
+internal static class MonitorFilters
+{
+    public static unsafe uint Add(IntPtr engine, IntPtr appIdBlob)
     {
         uint result;
 
+        var subLayer = new FWPM_SUBLAYER
+        {
+            subLayerKey = MonitorGuids.MONITOR_SAMPLE_SUBLAYER,
+            displayData = new FWPM_DISPLAY_DATA
+            {
+                name        = "Monitor Sample Sub layer",
+                description = "Monitor Sample Sub layer",
+            },
+        };
+
+        Console.WriteLine("Starting Transaction");
+        result = NativeMethods.FwpmTransactionBegin(engine, 0);
+        if (result != 0) { Abort(engine); return result; }
+        Console.WriteLine("Successfully Started Transaction");
+
+        Console.WriteLine("Adding Sublayer");
+        result = NativeMethods.FwpmSubLayerAdd(engine, ref subLayer, IntPtr.Zero);
+        if (result == NativeMethods.FWP_E_ALREADY_EXISTS)
+        {
+            Console.WriteLine("Sublayer already exists, reusing it");
+            result = 0;
+        }
+        if (result != 0) { Abort(engine); return result; }
+        Console.WriteLine("Sucessfully added Sublayer");
+
+        // ── Flow Established filter ──────────────────────────
+        var conditions = stackalloc FWPM_FILTER_CONDITION[2];
+        conditions[0].fieldKey   = MonitorGuids.FWPM_CONDITION_IP_PROTOCOL;
+        conditions[0].matchType  = NativeMethods.FWP_MATCH_EQUAL;
+        conditions[0].conditionValue.type  = NativeMethods.FWP_UINT8;
+        conditions[0].conditionValue.uint8 = NativeMethods.IPPROTO_TCP;
+
+        uint numConditions = 1;
+        if (appIdBlob != IntPtr.Zero)
+        {
+            conditions[1].fieldKey  = MonitorGuids.FWPM_CONDITION_ALE_APP_ID;
+            conditions[1].matchType = NativeMethods.FWP_MATCH_EQUAL;
+            conditions[1].conditionValue.type     = NativeMethods.FWP_BYTE_BLOB_TYPE;
+            conditions[1].conditionValue.byteBlob = appIdBlob;
+            numConditions = 2;
+        }
+
+        // Pin display-name strings for the duration of each FwpmFilterAdd call.
+        // FWPM_FILTER is passed as an unsafe pointer so the runtime does not
+        // marshal embedded structs — we must provide raw wchar_t* ourselves.
+        fixed (char* feNamePtr  = "Flow established filter.",
+                     feDescPtr  = "Sets up flow for traffic that we are interested in.",
+                     stNamePtr  = "Stream Layer Filter",
+                     stDescPtr  = "Monitors TCP traffic.")
+        {
+            var filter = new FWPM_FILTER
+            {
+                layerKey            = MonitorGuids.FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4,
+                displayData         = new FWPM_DISPLAY_DATA_NATIVE
+                {
+                    name        = (IntPtr)feNamePtr,
+                    description = (IntPtr)feDescPtr,
+                },
+                subLayerKey         = MonitorGuids.MONITOR_SAMPLE_SUBLAYER,
+                numFilterConditions = numConditions,
+                filterCondition     = conditions,
+            };
+            filter.action.type       = NativeMethods.FWP_ACTION_CALLOUT_INSPECTION;
+            filter.action.calloutKey = MonitorGuids.MONITOR_SAMPLE_FLOW_ESTABLISHED_CALLOUT_V4;
+            filter.weight.type       = NativeMethods.FWP_EMPTY;
+
+            Console.WriteLine(appIdBlob != IntPtr.Zero
+                ? "Adding Flow Established Filter (app-scoped)"
+                : "Adding Flow Established Filter (all processes)");
+
+            result = NativeMethods.FwpmFilterAdd(engine, &filter, IntPtr.Zero, null);
+            if (result != 0)
+            {
+                Console.Error.WriteLine($"FwpmFilterAdd (flow established) failed: 0x{result:x}");
+                if (result == NativeMethods.FWP_E_BUILTIN_OBJECT)
+                    Console.Error.WriteLine(
+                        "  FWP_E_BUILTIN_OBJECT: the kernel driver (msnmntr.sys) is not loaded " +
+                        "or has not registered its callouts. " +
+                        "Run 'addcallouts' first, then load the driver before running 'monitor'.");
+                Abort(engine);
+                return result;
+            }
+            Console.WriteLine("Successfully added Flow Established filter");
+
+            // ── Stream filter ────────────────────────────────────
+            filter = new FWPM_FILTER
+            {
+                layerKey            = MonitorGuids.FWPM_LAYER_STREAM_V4,
+                subLayerKey         = MonitorGuids.MONITOR_SAMPLE_SUBLAYER,
+                displayData         = new FWPM_DISPLAY_DATA_NATIVE
+                {
+                    name        = (IntPtr)stNamePtr,
+                    description = (IntPtr)stDescPtr,
+                },
+                numFilterConditions = 0,
+                filterCondition     = null,
+            };
+            filter.action.type       = NativeMethods.FWP_ACTION_CALLOUT_INSPECTION;
+            filter.action.calloutKey = MonitorGuids.MONITOR_SAMPLE_STREAM_CALLOUT_V4;
+            filter.weight.type       = NativeMethods.FWP_EMPTY;
+
+            Console.WriteLine("Adding Stream Filter");
+            result = NativeMethods.FwpmFilterAdd(engine, &filter, IntPtr.Zero, null);
+            if (result != 0) { Abort(engine); return result; }
+            Console.WriteLine("Successfully added Stream filter");
+        }
+
+        Console.WriteLine("Committing Transaction");
+        result = NativeMethods.FwpmTransactionCommit(engine);
+        if (result == 0) Console.WriteLine("Successfully Committed Transaction");
+        return result;
+    }
+
+    private static void Abort(IntPtr engine)
+    {
+        Console.WriteLine("Aborting Transaction");
+        uint r = NativeMethods.FwpmTransactionAbort(engine);
+        if (r == 0) Console.WriteLine("Successfully Aborted Transaction");
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Monitor operation
+// ──────────────────────────────────────────────────────────────
+internal static class MonitorApp
+{
+    public static uint DoMonitoring(string? appPath)
+    {
+        IntPtr device       = IntPtr.Zero;
+        IntPtr engine       = IntPtr.Zero;
+        IntPtr quitEvent    = IntPtr.Zero;
+        IntPtr applicationId = IntPtr.Zero;
+        EventThread? evtThread = null;
+        uint result;
+
+        var session = new FWPM_SESSION
+        {
+            displayData = new FWPM_DISPLAY_DATA
+            {
+                name        = "Monitor Sample Session",
+                description = "Monitors traffic at the Stream layer.",
+            },
+            flags = NativeMethods.FWPM_SESSION_FLAG_DYNAMIC,
+        };
+
+        Console.WriteLine("Opening Filtering Engine");
+        result = NativeMethods.FwpmEngineOpen(IntPtr.Zero, NativeMethods.RPC_C_AUTHN_WINNT,
+                                              IntPtr.Zero, ref session, out engine);
+        if (result != 0) goto cleanup;
+        Console.WriteLine("Successfully opened Filtering Engine");
+
+        if (appPath != null)
+        {
+            Console.WriteLine("Looking up Application ID from BFE");
+            result = NativeMethods.FwpmGetAppIdFromFileName(appPath, out applicationId);
+            if (result != 0) goto cleanup;
+            Console.WriteLine("Successfully retrieved Application ID");
+        }
+        else
+        {
+            Console.WriteLine("No application path specified - monitoring all processes");
+        }
+
+        Console.WriteLine("Opening Monitor Sample Device");
+        (device, result) = MonitorDevice.Open();
+        if (result != 0) goto cleanup;
+        Console.WriteLine("Successfully opened Monitor Device");
+
+        Console.WriteLine("Adding Filters through the Filtering Engine");
+        result = MonitorFilters.Add(engine, applicationId);
+        if (result != 0) goto cleanup;
+        Console.WriteLine("Successfully added Filters through the Filtering Engine");
+
+        Console.WriteLine("Enabling monitoring through the Monitor Sample Device");
+        var settings = new MONITOR_SETTINGS { monitorOperation = MONITOR_OPERATION_MODE.MonitorTraffic };
+        result = MonitorDevice.EnableMonitoring(device, settings);
+        if (result != 0) goto cleanup;
+        Console.WriteLine("Successfully enabled monitoring.");
+
+        quitEvent = NativeMethods.CreateEvent(IntPtr.Zero, true, false, IntPtr.Zero);
+        if (quitEvent == IntPtr.Zero) { result = NativeMethods.GetLastError(); goto cleanup; }
+
+        evtThread = new EventThread(device, quitEvent);
+        evtThread.Start();
+
+        Console.WriteLine("Monitoring... press any key to exit and cleanup filters.");
+        try
+        {
+            Console.ReadKey(intercept: true);
+        }
+        catch (InvalidOperationException)
+        {
+            // stdin is not a TTY (redirected); wait for Ctrl+C / process exit instead
+            Thread.Sleep(Timeout.Infinite);
+        }
+
+        NativeMethods.SetEvent(quitEvent);
+        unsafe { NativeMethods.CancelIoEx(device, null); }
+        evtThread.Join();
+
+    cleanup:
+        if (result != 0)
+            Console.WriteLine($"Monitor.\tError 0x{result:x} occurred during execution");
+
+        if (quitEvent != IntPtr.Zero) NativeMethods.CloseHandle(quitEvent);
+        if (device    != IntPtr.Zero) NativeMethods.CloseHandle(device);
+        if (applicationId != IntPtr.Zero) NativeMethods.FwpmFreeMemory(ref applicationId);
+        if (engine    != IntPtr.Zero) NativeMethods.FwpmEngineClose(engine);
+
+        return result;
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Entry point
+// ──────────────────────────────────────────────────────────────
+internal static class Program
+{
+    static int Main(string[] args)
+    {
         if (args.Length == 1)
         {
             if (string.Equals(args[0], "addcallouts", StringComparison.OrdinalIgnoreCase))
-            {
-                result = MonitorApp.AddCallouts();
-                return (int)result;
-            }
+                return (int)MonitorCallouts.Add();
+
             if (string.Equals(args[0], "delcallouts", StringComparison.OrdinalIgnoreCase))
-            {
-                result = MonitorApp.RemoveCallouts();
-                return (int)result;
-            }
+                return (int)MonitorCallouts.Remove();
+
             if (string.Equals(args[0], "monitor", StringComparison.OrdinalIgnoreCase))
-            {
-                result = MonitorApp.DoMonitoring(null);
-                return (int)result;
-            }
+                return (int)MonitorApp.DoMonitoring(null);
         }
 
-        if (args.Length == 2)
-        {
-            if (string.Equals(args[0], "monitor", StringComparison.OrdinalIgnoreCase))
-            {
-                result = MonitorApp.DoMonitoring(args[1]);
-                return (int)result;
-            }
-        }
+        if (args.Length == 2 && string.Equals(args[0], "monitor", StringComparison.OrdinalIgnoreCase))
+            return (int)MonitorApp.DoMonitoring(args[1]);
 
-        PrintUsage();
-        return 87; // ERROR_INVALID_PARAMETER
+        Console.Error.WriteLine("Usage: monitor ( addcallouts | delcallouts | monitor [targetApp.exe] )");
+        return unchecked((int)0x80070057u); // ERROR_INVALID_PARAMETER as HRESULT
     }
 }
