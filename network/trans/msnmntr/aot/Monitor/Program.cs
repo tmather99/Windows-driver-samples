@@ -952,6 +952,7 @@ internal static class MonitorApp
         IntPtr applicationId = IntPtr.Zero;
         EventThread? evtThread = null;
         uint result;
+        uint disableErr = 0;
 
         var session = new FWPM_SESSION
         {
@@ -1019,6 +1020,14 @@ internal static class MonitorApp
         evtThread.Join();
 
     cleanup:
+        // Try to disable monitoring before closing the device handle.
+        if (device != IntPtr.Zero)
+        {
+            disableErr = MonitorDevice.DisableMonitoring(device);
+            if (disableErr != 0)
+                Console.WriteLine($"DisableMonitoring.\tError 0x{disableErr:x} occurred during cleanup");
+        }
+
         if (result != 0)
             Console.WriteLine($"Monitor.\tError 0x{result:x} occurred during execution");
 
