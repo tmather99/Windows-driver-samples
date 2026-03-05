@@ -596,13 +596,16 @@ internal sealed class EventThread : IDisposable
 
                     if (err == NativeMethods.ERROR_IO_PENDING)
                     {
+                        // Queue was empty; kernel parked our request. Block until
+                        // an event arrives or shutdown is signaled.
                         ++asyncWaits;
 
+                        // Use a 1-second timeout so stats print even when no events arrive.
                         uint wait = NativeMethods.WaitForMultipleObjects(2, waitHandles, false, 1000);
 
                         if (wait == NativeMethods.WAIT_OBJECT_0)
                         {
-                            // Shutdown signaled
+                            // Shutdown: cancel the pending IOCTL and drain the completion.
                             NativeMethods.CancelIoEx(_device, &ov);
                             NativeMethods.WaitForSingleObject(ovEvent, NativeMethods.INFINITE);
                             ++canceled;
@@ -610,6 +613,7 @@ internal sealed class EventThread : IDisposable
                         }
                         else if (wait == NativeMethods.WAIT_OBJECT_0 + 1)
                         {
+                            // Event arrived and completed our pending IOCTL.
                             if (!NativeMethods.GetOverlappedResult(_device, &ov, out bytesReturned, false))
                             {
                                 err = NativeMethods.GetLastError();
@@ -622,10 +626,14 @@ internal sealed class EventThread : IDisposable
                                 }
                                 break;
                             }
-                            // fall through to process bytesReturned
+                            // Fall through to process bytesReturned below.
                         }
                         else if (wait == NativeMethods.WAIT_TIMEOUT)
                         {
+                            // No event in the last second — print stats and keep waiting.
+                            // Issuing a new DeviceIoControl with the same OVERLAPPED causes
+                            // the I/O Manager to implicitly cancel the prior pending IRP,
+                            // clearing g_PendingEventRequest before the new request arrives.
                             PrintStats(NativeMethods.GetTickCount64(), ref lastPrintMs, ref lastReceived,
                                        eventsReceived, asyncWaits, canceled, syncCompleted);
                             continue;
@@ -652,6 +660,7 @@ internal sealed class EventThread : IDisposable
                 }
                 else
                 {
+                    // IOCTL completed synchronously — queue had an event ready immediately.
                     ++syncCompleted;
                 }
 
@@ -738,7 +747,7 @@ internal static class MonitorCallouts
         callout = new FWPM_CALLOUT
         {
             calloutKey      = MonitorGuids.MONITOR_SAMPLE_STREAM_CALLOUT_V4,
-            displayData     = new FWPM_DISPLAY_DATA { name = STREAM_CALLOUT_NAME, description = STREAM_CALLOUT_DESCRIPTION },
+            displayData     = new FWPM_DISPLAY_DATA { name = STREAM_CALLOUT_DESCRIPTION, description = STREAM_CALLOUT_DESCRIPTION },
             applicableLayer = MonitorGuids.FWPM_LAYER_STREAM_V4,
             flags           = NativeMethods.FWPM_CALLOUT_FLAG_PERSISTENT,
         };
@@ -897,6 +906,7 @@ internal static class MonitorFilters
                         "  FWP_E_BUILTIN_OBJECT: the kernel driver (msnmntr.sys) is not loaded " +
                         "or has not registered its callouts. " +
                         "Run 'addcallouts' first, then load the driver before running 'monitor'.");
+
                 Abort(engine);
                 return result;
             }
@@ -913,7 +923,7 @@ internal static class MonitorFilters
                     description = (IntPtr)stDescPtr,
                 },
                 numFilterConditions = 0,
-                filterCondition     = null,
+                filterCondition     = conditions,
             };
             filter.action.type       = NativeMethods.FWP_ACTION_CALLOUT_INSPECTION;
             filter.action.calloutKey = MonitorGuids.MONITOR_SAMPLE_STREAM_CALLOUT_V4;
