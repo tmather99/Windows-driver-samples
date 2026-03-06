@@ -301,6 +301,7 @@ internal static partial class NativeMethods
     public static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
     public const uint WAIT_OBJECT_0 = 0;
     public const uint INFINITE = 0xFFFFFFFF;
+    public const uint WAIT_TIMEOUT = 0x00000102;
     public const uint ERROR_IO_PENDING = 997;
     public const uint ERROR_OPERATION_ABORTED = 995;
 
@@ -905,7 +906,9 @@ internal static class MonitorApp
                     // (visible as spurious trace lines in the kernel log).
                     ++asyncWaits;
 
-                    uint wait = NativeMethods.WaitForMultipleObjects(2, waitHandles, false, NativeMethods.INFINITE);
+                    // Use a finite timeout so we can periodically print stats even when
+                    // no events arrive.  Wake every 1s.
+                    uint wait = NativeMethods.WaitForMultipleObjects(2, waitHandles, false, 1000);
 
                     if (wait == NativeMethods.WAIT_OBJECT_0)
                     {
@@ -930,10 +933,17 @@ internal static class MonitorApp
                         }
                         // Fall through to process bytesReturned below.
                     }
-                    else
+                    else if (wait == NativeMethods.WAIT_TIMEOUT)
                     {
-                        break;
+                        // Timeout: no event yet. Print periodic stats and continue waiting.
+                        MonitorAppPrintStats(MonitorAppGetTickMs(), ref lastPrintMs, ref lastReceived,
+                                             eventsReceived, asyncWaits, canceled, syncCompleted);
+                        continue;
                     }
+                     else
+                     {
+                         break;
+                     }
                 }
                 else if (err == NativeMethods.ERROR_OPERATION_ABORTED)
                 {
